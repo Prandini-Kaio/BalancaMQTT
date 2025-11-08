@@ -137,27 +137,27 @@ python src/servidor_assinante.py --api-port 8000
 
 ## 🎮 Simulação Manual
 
-Além da simulação automática realizada pelos sensores, é possível simular retiradas e reposições manualmente através de duas APIs REST:
+Além da simulação automática realizada pelos sensores, é possível simular retiradas e reposições manualmente através do backend. **Todas as requisições são centralizadas no backend**, que:
+1. Atualiza o peso diretamente no sensor do publicador (reflete na balança real)
+2. Publica mensagem MQTT com a nova leitura
 
-### Via Backend (publica mensagens MQTT)
-
-O backend pode simular retiradas/reposições que publicam mensagens MQTT:
+### Via Backend (centralizado)
 
 ```bash
-# Retirada via backend
+# Retirada via backend (atualiza sensor + MQTT)
 curl -X POST http://localhost:5000/api/produtos/1/retirada \
   -H "Content-Type: application/json" \
   -d '{"quantidade": 50}'
 
-# Reposição via backend
+# Reposição via backend (atualiza sensor + MQTT)
 curl -X POST http://localhost:5000/api/produtos/1/reposicao \
   -H "Content-Type: application/json" \
   -d '{"quantidade": 25}'
 ```
 
-### Via Publicador (modifica peso diretamente no sensor)
+### API do Publicador (avançado)
 
-O publicador expõe uma API REST na porta 5001 para controle direto dos sensores:
+O publicador também expõe uma API REST na porta 5001 para acesso direto aos sensores (uso avançado):
 
 ```bash
 # Listar sensores ativos
@@ -165,21 +165,9 @@ curl http://localhost:5001/api/sensores
 
 # Status de um sensor específico
 curl http://localhost:5001/api/sensores/1
-
-# Retirar peso diretamente do sensor
-curl -X POST http://localhost:5001/api/sensores/1/retirada \
-  -H "Content-Type: application/json" \
-  -d '{"quantidade": 30}'
-
-# Repor peso diretamente no sensor
-curl -X POST http://localhost:5001/api/sensores/1/reposicao \
-  -H "Content-Type: application/json" \
-  -d '{"quantidade": 20}'
 ```
 
-**Diferenças:**
-- **Backend (`/api/produtos/{id}/retirada`)**: Publica mensagem MQTT que simula uma leitura de sensor
-- **Publicador (`/api/sensores/{id}/retirada`)**: Modifica o peso diretamente no sensor, que publicará a nova leitura na próxima iteração
+**Nota:** Para operações de retirada/reposição, use sempre o backend (`/api/produtos/{id}/retirada` ou `/reposicao`), que garante que tanto o sensor quanto o MQTT sejam atualizados corretamente.
 
 ## 📊 Estrutura de Dados
 
@@ -400,11 +388,57 @@ BalancaMQTT/
 └── dados.csv                     # Dados salvos (gerado automaticamente)
 ```
 
-## 📄 Licença
+Agradecemos às seguintes pessoas que contribuíram para este projeto:
 
-Este projeto foi desenvolvido para fins educacionais.
-
-## 👨‍💻 Autor
-
-Sistema de Monitoramento de Estoque por Peso - MQTT
-Desenvolvido para projeto acadêmico
+<table>
+  <tr>
+    <td align="center">
+      <a href="https://github.com/prandini-kaio/" title="Perfil de Kaio Prandini no GitHub">
+        <img src="https://avatars.githubusercontent.com/u/73852163?s=400&u=ca4d7ff329ee88f529ea386b8b42a95918de08bb&v=4" width="100px;" alt="Foto de Kaio Prandini no GitHub"/><br>
+        <sub>
+          <b>Kaio Prandini</b>
+        </sub>
+      </a>
+    </td>
+    <td align="center">
+      <a href="https://github.com/rafaznavarro/" title="Perfil de Rafael Navarro no GitHub">
+        <img src="https://avatars.githubusercontent.com/u/118142650?v=4" width="100px;" alt="Foto de Rafael Navarro no GitHub"/><br>
+        <sub>
+          <b>Rafael Navarro</b>
+        </sub>
+      </a>
+    </td>
+    <td align="center">
+      <a href="https://github.com/Nogs0/" title="Perfil de João Nogueira no GitHub">
+        <img src="https://avatars.githubusercontent.com/u/108362664?v=4" width="100px;" alt="Foto de João Nogueira no GitHub"/><br>
+        <sub>
+          <b>João Nogueira</b>
+        </sub>
+      </a>
+    </td>
+    <td align="center">
+      <a href="https://github.com/dudu-passoni/" title="Perfil de Dudu Passoni no GitHub">
+        <img src="https://avatars.githubusercontent.com/u/115907714?v=4" width="100px;" alt="Foto de João Nogueira no GitHub"/><br>
+        <sub>
+          <b>Luis Eduardo Passoni</b>
+        </sub>
+      </a>
+    </td>
+    <td align="center">
+      <a href="#" title="defina o título do link">
+        <img src="https://s2.glbimg.com/FUcw2usZfSTL6yCCGj3L3v3SpJ8=/smart/e.glbimg.com/og/ed/f/original/2019/04/25/zuckerberg_podcast.jpg" width="100px;" alt="Foto do Mark Zuckerberg"/><br>
+        <sub>
+          <b>Mark Zuckerberg</b>
+        </sub>
+      </a>
+    </td>
+    <td align="center">
+      <a href="#" title="defina o título do link">
+        <img src="https://miro.medium.com/max/360/0*1SkS3mSorArvY9kS.jpg" width="100px;" alt="Foto do Steve Jobs"/><br>
+        <sub>
+          <b>Steve Jobs</b>
+        </sub>
+      </a>
+    </td>
+  </tr>
+</table>

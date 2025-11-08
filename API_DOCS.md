@@ -110,7 +110,7 @@ Remove um produto cadastrado.
 ### 5. Simular Retirada Manual
 **POST** `/api/produtos/{produto_id}/retirada`
 
-Simula a retirada manual de produtos (reduz o peso do estoque).
+Simula a retirada manual de produtos (reduz o peso do estoque). **Centralizado no backend**: atualiza o sensor no publicador e publica mensagem MQTT.
 
 **Parâmetros:**
 - `produto_id` (int) - ID do produto
@@ -128,14 +128,21 @@ Simula a retirada manual de produtos (reduz o peso do estoque).
 **Resposta (200):**
 ```json
 {
-  "mensagem": "Retirada simulada com sucesso",
+  "mensagem": "Retirada executada com sucesso",
   "produto_id": 1,
   "produto_nome": "Leite",
   "peso_anterior": 750.50,
   "quantidade_retirada": 75.05,
-  "peso_novo": 675.45
+  "peso_novo": 675.45,
+  "sensor_atualizado": true,
+  "mqtt_publicado": true
 }
 ```
+
+**Comportamento:**
+1. Atualiza o peso diretamente no sensor do publicador (reflete na balança real)
+2. Publica mensagem MQTT com a nova leitura
+3. O sensor publicará automaticamente na próxima iteração
 
 **Erros:**
 - `404`: Produto não encontrado
@@ -158,7 +165,7 @@ curl -X POST http://localhost:5000/api/produtos/1/retirada
 ### 6. Simular Reposição Manual
 **POST** `/api/produtos/{produto_id}/reposicao`
 
-Simula a reposição manual de produtos (aumenta o peso do estoque).
+Simula a reposição manual de produtos (aumenta o peso do estoque). **Centralizado no backend**: atualiza o sensor no publicador e publica mensagem MQTT.
 
 **Parâmetros:**
 - `produto_id` (int) - ID do produto
@@ -176,16 +183,23 @@ Simula a reposição manual de produtos (aumenta o peso do estoque).
 **Resposta (200):**
 ```json
 {
-  "mensagem": "Reposição simulada com sucesso",
+  "mensagem": "Reposição executada com sucesso",
   "produto_id": 1,
   "produto_nome": "Leite",
   "peso_anterior": 150.50,
   "quantidade_adicionada": 25.0,
-  "peso_novo": 175.50
+  "peso_novo": 175.50,
+  "sensor_atualizado": true,
+  "mqtt_publicado": true
 }
 ```
 
 **Nota:** O peso não ultrapassa o `pesoMaximo` cadastrado para o produto.
+
+**Comportamento:**
+1. Atualiza o peso diretamente no sensor do publicador (reflete na balança real)
+2. Publica mensagem MQTT com a nova leitura
+3. O sensor publicará automaticamente na próxima iteração
 
 **Erros:**
 - `404`: Produto não encontrado
@@ -405,5 +419,6 @@ A API possui CORS habilitado, permitindo requisições de qualquer origem.
 - Os alertas são enviados via WebSocket quando o peso atinge nível crítico
 - O tópico MQTT é gerado automaticamente se não informado
 - O publicador busca produtos cadastrados via API automaticamente
-- As simulações manuais de retirada/reposição publicam mensagens MQTT que são processadas normalmente pelo backend
+- **Todas as requisições são centralizadas no backend**: retiradas/reposições atualizam o sensor no publicador E publicam MQTT
 - As simulações automáticas continuam funcionando em paralelo com as simulações manuais
+- O backend se comunica com o publicador via API REST para atualizar os sensores diretamente

@@ -4,6 +4,7 @@ import csv
 import os
 import time
 import random
+import requests
 from datetime import datetime
 import argparse
 from threading import Thread, Lock
@@ -19,6 +20,7 @@ TOPIC_SUBSCRIBE = f"{TOPIC_BASE}/#"
 ARQUIVO_CSV = "dados.csv"
 API_HOST = "0.0.0.0"
 API_PORT = 5000
+PUBLICADOR_API_URL = "http://localhost:5001"
 
 
 """
@@ -29,12 +31,13 @@ Recebe dados MQTT de sensores de produtos e expõe WebSocket para frontend
 class ServidorBackend:
     """Classe que gerencia o servidor coletor de dados MQTT"""
     
-    def __init__(self, broker_host, broker_port, arquivo_csv, api_host, api_port):
+    def __init__(self, broker_host, broker_port, arquivo_csv, api_host, api_port, publicador_api_url):
         self.broker_host = broker_host
         self.broker_port = broker_port
         self.arquivo_csv = arquivo_csv
         self.api_host = api_host
         self.api_port = api_port
+        self.publicador_api_url = publicador_api_url
         
         # Cliente MQTT (assinante)
         self.client = mqtt.Client(client_id="servidor_coletor")
@@ -50,11 +53,9 @@ class ServidorBackend:
         self.lock = Lock()
         self.leituras_recebidas = 0
         self.alertas_recebidos = 0
-        # Produtos cadastrados: {produto_id: {nome, pesoMinimo, pesoMaximo, pesoIdeal, topic}}
+
         self.produtos_cadastrados = {}
-        # Dados atuais dos produtos: {produto_id: {dados do produto}}
         self.produtos_dados = {}
-        # Contador de IDs de produtos
         self.next_produto_id = 1
         
         # Flask + SocketIO
@@ -205,7 +206,7 @@ class ServidorBackend:
             # Calcula estado
             estado = self._calcular_estado(peso_atual_kg, peso_minimo_kg, peso_ideal_kg)
             
-            # Prepara dados para WebSocket (formato especificado)
+            # Prepara dados para WebSocket
             dados_produto = {
                 'Produto': produto_nome,
                 'nivelEstoque': round(peso_atual_kg, 2),
@@ -218,7 +219,7 @@ class ServidorBackend:
             # Armazena dados do produto
             self.produtos_dados[produto_id] = dados_produto
         
-        # Envia via WebSocket (fora do lock para evitar deadlock)
+        # Envia via WebSocket **fora do lock para evitar deadlock
         self._enviar_via_websocket('produto_atualizado', dados_produto)
         
         # Exibe no console
@@ -290,6 +291,26 @@ class ServidorBackend:
             return self.client_publisher_connected
         except Exception as e:
             print(f"[ERRO] Falha ao conectar publisher: {e}")
+            return False
+    
+    def _atualizar_sensor_publicador(self, produto_id, quantidade_kg, tipo_operacao):
+        """Atualiza o sensor no publicador via API"""
+        try:
+            endpoint = f"{self.publicador_api_url}/api/sensores/{produto_id}/{tipo_operacao}"
+            response = requests.post(
+                endpoint,
+                json={'quantidade': quantidade_kg},
+                timeout=3
+            )
+            if response.status_code == 200:
+                print(f"[PUBLICADOR] Sensor atualizado: {tipo_operacao} de {quantidade_kg:.2f}kg")
+                return True
+            else:
+                print(f"[AVISO] Falha ao atualizar sensor no publicador. Status: {response.status_code}")
+                return False
+        except requests.exceptions.RequestException as e:
+            print(f"[AVISO] Não foi possível conectar ao publicador: {e}")
+            print(f"[AVISO] Certifique-se de que o publicador está rodando em {self.publicador_api_url}")
             return False
     
     def _publicar_simulacao(self, produto_id, peso_novo_kg):
@@ -419,7 +440,7 @@ class ServidorBackend:
         
         @self.app.route('/api/produtos/<int:produto_id>/retirada', methods=['POST'])
         def simular_retirada(produto_id):
-            """Simula retirada manual de produtos"""
+            """Simula retirada manual de produtos - centralizado no backend"""
             try:
                 data = request.get_json() or {}
                 quantidade_kg = float(data.get('quantidade', 0))  # Quantidade em KG
@@ -443,18 +464,25 @@ class ServidorBackend:
                     # Calcula novo peso
                     peso_novo_kg = max(0, peso_atual_kg - quantidade_kg)
                 
-                # Publica mensagem MQTT simulada
-                if self._publicar_simulacao(produto_id, peso_novo_kg):
+                # 1. Atualiza o sensor no publicador (reflete na balança real)
+                sensor_atualizado = self._atualizar_sensor_publicador(produto_id, quantidade_kg, 'retirada')
+                
+                # 2. Publica mensagem MQTT (o sensor também publicará na próxima iteração)
+                mqtt_publicado = self._publicar_simulacao(produto_id, peso_novo_kg)
+                
+                if sensor_atualizado or mqtt_publicado:
                     return jsonify({
-                        'mensagem': 'Retirada simulada com sucesso',
+                        'mensagem': 'Retirada executada com sucesso',
                         'produto_id': produto_id,
                         'produto_nome': produto['nome'],
                         'peso_anterior': round(peso_atual_kg, 2),
                         'quantidade_retirada': round(quantidade_kg, 2),
-                        'peso_novo': round(peso_novo_kg, 2)
+                        'peso_novo': round(peso_novo_kg, 2),
+                        'sensor_atualizado': sensor_atualizado,
+                        'mqtt_publicado': mqtt_publicado
                     }), 200
                 else:
-                    return jsonify({'erro': 'Falha ao publicar simulação MQTT'}), 500
+                    return jsonify({'erro': 'Falha ao executar retirada. Verifique se o publicador está rodando.'}), 500
                     
             except ValueError as e:
                 return jsonify({'erro': f'Valor inválido: {str(e)}'}), 400
@@ -463,7 +491,7 @@ class ServidorBackend:
         
         @self.app.route('/api/produtos/<int:produto_id>/reposicao', methods=['POST'])
         def simular_reposicao(produto_id):
-            """Simula reposição manual de produtos"""
+            """Simula reposição manual de produtos - centralizado no backend"""
             try:
                 data = request.get_json() or {}
                 quantidade_kg = float(data.get('quantidade', 0))  # Quantidade em KG
@@ -473,32 +501,35 @@ class ServidorBackend:
                         return jsonify({'erro': 'Produto não encontrado'}), 404
                     
                     produto = self.produtos_cadastrados[produto_id]
-                    
-                    # Obtém peso atual do produto (se existir)
+
                     if produto_id in self.produtos_dados:
                         peso_atual_kg = self.produtos_dados[produto_id].get('pesoAtual', 0)
                     else:
                         peso_atual_kg = 0
-                    
-                    # Se quantidade não foi especificada, usa valor aleatório (1-5kg)
+
+                    # Se quantidade não foi especificada, usa um valor aleatório 1 a 5kg
                     if quantidade_kg <= 0:
                         quantidade_kg = random.uniform(1, 5)
                     
-                    # Calcula novo peso (não ultrapassa o máximo)
+                    # Calcula novo peso sem ultrapassar o máximo
                     peso_novo_kg = min(produto['pesoMaximo'], peso_atual_kg + quantidade_kg)
+
+                sensor_atualizado = self._atualizar_sensor_publicador(produto_id, quantidade_kg, 'reposicao')
+                mqtt_publicado = self._publicar_simulacao(produto_id, peso_novo_kg)
                 
-                # Publica mensagem MQTT simulada
-                if self._publicar_simulacao(produto_id, peso_novo_kg):
+                if sensor_atualizado or mqtt_publicado:
                     return jsonify({
-                        'mensagem': 'Reposição simulada com sucesso',
+                        'mensagem': 'Reposição executada com sucesso',
                         'produto_id': produto_id,
                         'produto_nome': produto['nome'],
                         'peso_anterior': round(peso_atual_kg, 2),
                         'quantidade_adicionada': round(quantidade_kg, 2),
-                        'peso_novo': round(peso_novo_kg, 2)
+                        'peso_novo': round(peso_novo_kg, 2),
+                        'sensor_atualizado': sensor_atualizado,
+                        'mqtt_publicado': mqtt_publicado
                     }), 200
                 else:
-                    return jsonify({'erro': 'Falha ao publicar simulação MQTT'}), 500
+                    return jsonify({'erro': 'Falha ao executar reposição. Verifique se o publicador está rodando.'}), 500
                     
             except ValueError as e:
                 return jsonify({'erro': f'Valor inválido: {str(e)}'}), 400
@@ -516,16 +547,13 @@ class ServidorBackend:
                 with self.lock:
                     produtos_list = list(self.produtos_dados.values())
                     num_produtos = len(produtos_list)
-                
-                # Emite para o cliente que acabou de conectar
-                # No handler de connect, emit sem broadcast envia apenas para o cliente atual
+
                 if num_produtos > 0:
                     print(f"[WEBSOCKET] Enviando {num_produtos} produto(s) iniciais")
                     emit('produtos_iniciais', produtos_list)
                 else:
                     print(f"[WEBSOCKET] Nenhum produto com dados ainda. Enviando lista vazia para confirmar conexão.")
                     emit('produtos_iniciais', [])
-                    # Envia também uma mensagem de teste
                     emit('teste', {'mensagem': 'WebSocket funcionando!'})
             except Exception as e:
                 print(f"[ERRO] Falha ao enviar produtos iniciais: {e}")
@@ -557,6 +585,9 @@ class ServidorBackend:
         print(f"       POST /api/produtos - Cadastrar produto")
         print(f"       GET  /api/produtos - Listar produtos cadastrados")
         print(f"       DELETE /api/produtos/<id> - Remover produto")
+        print(f"       POST /api/produtos/<id>/retirada - Retirar peso (atualiza sensor + MQTT)")
+        print(f"       POST /api/produtos/<id>/reposicao - Repor peso (atualiza sensor + MQTT)")
+        print(f"[API] Publicador: {self.publicador_api_url}")
     
     def executar(self):
         """Executa o servidor backend (MQTT + WebSocket)"""
@@ -566,6 +597,7 @@ class ServidorBackend:
         print(f"Broker MQTT: {self.broker_host}:{self.broker_port}")
         print(f"Tópico: {TOPIC_SUBSCRIBE}")
         print(f"API/WebSocket: http://{self.api_host}:{self.api_port}")
+        print(f"Publicador API: {self.publicador_api_url}")
         print(f"Arquivo CSV: {self.arquivo_csv}")
         print("=" * 70)
         
@@ -624,6 +656,11 @@ def main():
         default=API_PORT,
         help=f"Porta da API/WebSocket (padrão: {API_PORT})"
     )
+    parser.add_argument(
+        "--publicador-api-url",
+        default=PUBLICADOR_API_URL,
+        help=f"URL da API do publicador (padrão: {PUBLICADOR_API_URL})"
+    )
     
     args = parser.parse_args()
     
@@ -632,7 +669,8 @@ def main():
         broker_port=args.port,
         arquivo_csv=args.csv,
         api_host=args.api_host,
-        api_port=args.api_port
+        api_port=args.api_port,
+        publicador_api_url=args.publicador_api_url
     )
     
     servidor.executar()

@@ -13,9 +13,9 @@ BROKER_HOST = "test.mosquitto.org"
 BROKER_PORT = 1883
 TOPIC_BASE = "estoque"
 API_URL = "http://localhost:5000"
-INTERVALO_MEDICAO = 3  # segundos
-INTERVALO_VERIFICACAO_PRODUTOS = 10  # segundos - intervalo para verificar novos produtos
-API_PORT_PUBLICADOR = 5001  # Porta para API do publicador
+INTERVALO_MEDICAO = 3
+INTERVALO_VERIFICACAO_PRODUTOS = 10
+API_PORT_PUBLICADOR = 5001
 
 
 """
@@ -35,7 +35,7 @@ class SensorPeso:
         self.peso_minimo = peso_minimo
         self.peso_maximo = peso_maximo
         self.peso_ideal = peso_ideal
-        self.peso_critico = peso_minimo  # Peso crítico = peso mínimo
+        self.peso_critico = peso_minimo
         self.topic = topic
         self.client = client
         self.topic_peso = topic
@@ -54,7 +54,7 @@ class SensorPeso:
         reducao = self.peso_atual * reducao_percentual
         self.peso_atual = max(0, self.peso_atual - reducao)
         
-        # Ocasionalmente pode haver reposição (aumenta peso até o máximo)
+        # Ocasionalmente pode haver reposição ---- aumenta peso até o máximo
         if random.random() < 0.1:  # 10% de chance de reposição
             reposicao = random.uniform(1000, 5000)  # Entre 1kg e 5kg
             self.peso_atual = min(self.peso_maximo * 1000, self.peso_atual + reposicao)
@@ -131,7 +131,7 @@ class SensorPeso:
         quantidade_gramas = quantidade_kg * 1000
         self.peso_atual = min(self.peso_maximo * 1000, self.peso_atual + quantidade_gramas)
         print(f"[REPOSIÇÃO MANUAL] {self.produto_nome}: {quantidade_kg:.2f}kg adicionados. Novo peso: {self.peso_atual/1000:.2f}kg")
-        return self.peso_atual / 1000  # Retorna peso em KG
+        return self.peso_atual / 1000
     
     def get_status(self):
         """Retorna status atual do sensor"""
@@ -160,7 +160,7 @@ class PublicadorBalancas:
         self.threads = []
         self.conectado = False
         self.lock = Lock()
-        self.produtos_processados = set()  # IDs de produtos já processados
+        self.produtos_processados = set()
         self.running = False
         
         # Flask app para API REST do publicador
@@ -223,8 +223,7 @@ class PublicadorBalancas:
         with self.lock:
             for produto in produtos:
                 produto_id = produto['produto_id']
-                
-                # Verifica se o produto já foi processado
+
                 if produto_id in self.produtos_processados:
                     continue
                 
@@ -263,7 +262,7 @@ class PublicadorBalancas:
                     novos_sensores = self.criar_sensores(produtos)
                     if novos_sensores > 0:
                         print(f"[INFO] {novos_sensores} novo(s) produto(s) encontrado(s). Iniciando sensores...")
-                        # Inicia novos sensores
+                        # Inicia novos sensores para produts cadastrados
                         with self.lock:
                             sensores_para_iniciar = [s for s in self.sensores if not s.ativo]
                             for sensor in sensores_para_iniciar:
@@ -272,8 +271,7 @@ class PublicadorBalancas:
                                 self.threads.append(thread)
             except Exception as e:
                 print(f"[ERRO] Erro ao verificar novos produtos: {e}")
-            
-            # Aguarda antes de verificar novamente
+
             time.sleep(INTERVALO_VERIFICACAO_PRODUTOS)
     
     def _configurar_rotas_api(self):
