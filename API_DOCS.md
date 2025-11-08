@@ -56,9 +56,58 @@ Cadastra um novo produto para simulação.
 }
 ```
 
+**Validações:**
+- Nome do produto é obrigatório
+- Pesos devem ser maiores que zero
+- `pesoMinimo` deve ser menor que `pesoMaximo`
+- `pesoIdeal` deve estar entre `pesoMinimo` e `pesoMaximo`
+- **Não permite dois produtos com o mesmo nome** (comparação case-insensitive)
+- **Não permite dois produtos com o mesmo tópico MQTT**
+
 **Erros:**
 - `400`: Campos obrigatórios faltando ou valores inválidos
+- `409`: Já existe um produto com o mesmo nome ou tópico
 - `500`: Erro interno do servidor
+
+**Exemplo de sucesso:**
+```bash
+curl -X POST http://localhost:5000/api/produtos \
+  -H "Content-Type: application/json" \
+  -d '{
+    "nome": "Leite",
+    "pesoMinimo": 100,
+    "pesoMaximo": 1000,
+    "pesoIdeal": 500
+  }'
+```
+
+**Exemplo de erro - produto duplicado:**
+```bash
+# Primeira tentativa - sucesso
+curl -X POST http://localhost:5000/api/produtos \
+  -H "Content-Type: application/json" \
+  -d '{"nome": "Leite", "pesoMinimo": 100, "pesoMaximo": 1000}'
+
+# Segunda tentativa - erro 409
+curl -X POST http://localhost:5000/api/produtos \
+  -H "Content-Type: application/json" \
+  -d '{"nome": "Leite", "pesoMinimo": 50, "pesoMaximo": 500}'
+# Resposta: {"erro": "Já existe um produto com o nome \"Leite\""}
+```
+
+**Exemplo de erro - tópico duplicado:**
+```bash
+# Primeira tentativa - sucesso
+curl -X POST http://localhost:5000/api/produtos \
+  -H "Content-Type: application/json" \
+  -d '{"nome": "Leite", "topic": "estoque/custom/peso"}'
+
+# Segunda tentativa - erro 409
+curl -X POST http://localhost:5000/api/produtos \
+  -H "Content-Type: application/json" \
+  -d '{"nome": "Refrigerante", "topic": "estoque/custom/peso"}'
+# Resposta: {"erro": "Já existe um produto usando o tópico \"estoque/custom/peso\""}
+```
 
 ---
 

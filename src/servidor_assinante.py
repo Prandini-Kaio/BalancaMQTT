@@ -208,12 +208,12 @@ class ServidorBackend:
             
             # Prepara dados para WebSocket
             dados_produto = {
-                'Produto': produto_nome,
-                'nivelEstoque': round(peso_atual_kg, 2),
-                'pesoMinimo': peso_minimo_kg,
-                'pesoMaximo': peso_maximo_kg,
-                'pesoAtual': round(peso_atual_kg, 2),
-                'ultimaAtualizacao': timestamp
+                'produto': produto_nome,
+                'peso_minimo': peso_minimo_kg,
+                'peso_maximo': peso_maximo_kg,
+                'peso_atual': round(peso_atual_kg, 2),
+                'peso_ideal': round(peso_ideal_kg, 2),
+                'ultima_atualizacao': timestamp
             }
             
             # Armazena dados do produto
@@ -249,6 +249,7 @@ class ServidorBackend:
                 'produto_nome': produto_nome,
                 'peso_atual': round(peso_atual / 1000, 2),
                 'peso_critico': round(peso_critico / 1000, 2),
+                'peso_ideal': round(peso_critico / 1000, 2),
                 'tipo': dados.get('tipo', 'REPOSICAO_URGENTE'),
                 'mensagem': mensagem,
                 'timestamp': timestamp
@@ -394,6 +395,19 @@ class ServidorBackend:
                     return jsonify({'erro': 'pesoIdeal deve estar entre pesoMinimo e pesoMaximo'}), 400
                 
                 with self.lock:
+                    # Validação: verifica se já existe produto com o mesmo nome
+                    for produto_existente in self.produtos_cadastrados.values():
+                        if produto_existente['nome'].lower() == nome.lower():
+                            return jsonify({'erro': f'Já existe um produto com o nome "{nome}"'}), 409
+                    
+                    # Determina o tópico (gera automaticamente se não informado)
+                    topic_final = topic if topic else f"{TOPIC_BASE}/produto{self.next_produto_id}/peso"
+                    
+                    # Validação: verifica se já existe produto com o mesmo tópico
+                    for produto_existente in self.produtos_cadastrados.values():
+                        if produto_existente['topic'] == topic_final:
+                            return jsonify({'erro': f'Já existe um produto usando o tópico "{topic_final}"'}), 409
+                    
                     produto_id = self.next_produto_id
                     self.next_produto_id += 1
                     
@@ -403,12 +417,12 @@ class ServidorBackend:
                         'pesoMinimo': peso_minimo,
                         'pesoMaximo': peso_maximo,
                         'pesoIdeal': peso_ideal,
-                        'topic': topic if topic else f"{TOPIC_BASE}/produto{produto_id}/peso"
+                        'topic': topic_final
                     }
                     
                     self.produtos_cadastrados[produto_id] = produto
                     
-                    print(f"[INFO] Produto cadastrado: ID {produto_id} - {nome}")
+                    print(f"[INFO] Produto cadastrado: ID {produto_id} - {nome} (tópico: {topic_final})")
                 
                 return jsonify(produto), 201
                 
