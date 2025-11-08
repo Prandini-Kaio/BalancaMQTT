@@ -3,12 +3,13 @@ import json
 import csv
 import os
 import time
+import random
 from datetime import datetime
 import argparse
 from threading import Thread, Lock
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 from flask_cors import CORS
-from collections import defaultdict
+from flask_socketio import SocketIO, emit
 
 # Config padrao
 BROKER_HOST = "test.mosquitto.org"
@@ -21,7 +22,8 @@ API_PORT = 5000
 
 
 """
-Servidor Backend
+Servidor Backend - Coletor MQTT + WebSocket + API REST
+Recebe dados MQTT de sensores de produtos e expõe WebSocket para frontend
 """
 
 class ServidorBackend:
@@ -34,26 +36,39 @@ class ServidorBackend:
         self.api_host = api_host
         self.api_port = api_port
         
-        # Cliente MQTT
+        # Cliente MQTT (assinante)
         self.client = mqtt.Client(client_id="servidor_coletor")
         self.client.on_connect = self.on_connect
         self.client.on_message = self.on_message
         self.client.on_subscribe = self.on_subscribe
         
+        # Cliente MQTT para publicação (simulação manual)
+        self.client_publisher = mqtt.Client(client_id="servidor_coletor_publisher")
+        self.client_publisher_connected = False
+        
         # Armazenamento em memória
         self.lock = Lock()
         self.leituras_recebidas = 0
         self.alertas_recebidos = 0
-        # Estrutura: {prateleira_id: {sensor_id: {última_leituras, peso_atual, etc}}}
-        self.dados_prateleiras = defaultdict(lambda: defaultdict(dict))
-        # Lista de alertas ativos
-        self.alertas_ativos = []
-        # Histórico de leituras (últimas 100 por sensor)
-        self.historico = defaultdict(lambda: defaultdict(list))
-
+        # Produtos cadastrados: {produto_id: {nome, pesoMinimo, pesoMaximo, pesoIdeal, topic}}
+        self.produtos_cadastrados = {}
+        # Dados atuais dos produtos: {produto_id: {dados do produto}}
+        self.produtos_dados = {}
+        # Contador de IDs de produtos
+        self.next_produto_id = 1
+        
+        # Flask + SocketIO
         self.app = Flask(__name__)
         CORS(self.app)
+        self.socketio = SocketIO(
+            self.app, 
+            cors_allowed_origins="*", 
+            async_mode='threading',
+            ping_timeout=60,
+            ping_interval=25
+        )
         self._configurar_rotas()
+        self._configurar_websocket()
         
         self.inicializar_csv()
     
@@ -65,8 +80,8 @@ class ServidorBackend:
                 writer.writerow([
                     'timestamp_recebimento',
                     'tipo',
-                    'prateleira_id',
-                    'sensor_id',
+                    'produto_id',
+                    'produto_nome',
                     'peso_gramas',
                     'peso_inicial',
                     'percentual_restante',
@@ -87,8 +102,8 @@ class ServidorBackend:
                     writer.writerow([
                         timestamp_recebimento,
                         'PESO',
-                        dados.get('prateleira_id', ''),
-                        dados.get('sensor_id', ''),
+                        dados.get('produto_id', ''),
+                        dados.get('produto_nome', ''),
                         dados.get('peso_gramas', ''),
                         dados.get('peso_inicial', ''),
                         dados.get('percentual_restante', ''),
@@ -100,8 +115,8 @@ class ServidorBackend:
                     writer.writerow([
                         timestamp_recebimento,
                         'ALERTA',
-                        dados.get('prateleira_id', ''),
-                        dados.get('sensor_id', ''),
+                        dados.get('produto_id', ''),
+                        dados.get('produto_nome', ''),
                         dados.get('peso_atual', ''),
                         '',
                         '',
@@ -111,6 +126,26 @@ class ServidorBackend:
                     ])
         except Exception as e:
             print(f"[ERRO] Falha ao salvar no CSV: {e}")
+    
+    def _calcular_estado(self, peso_atual_kg, peso_minimo_kg, peso_ideal_kg):
+        """Calcula o estado do estoque baseado no peso atual, mínimo e ideal"""
+        if peso_atual_kg <= peso_minimo_kg:
+            return 'CRITICO'
+        elif peso_atual_kg <= peso_ideal_kg:
+            return 'BAIXO'
+        else:
+            return 'IDEAL'
+    
+    def _enviar_via_websocket(self, evento, dados):
+        """Envia dados via WebSocket para todos os clientes conectados"""
+        try:
+            # Envia para todos os clientes conectados (sem room = broadcast para todos)
+            self.socketio.emit(evento, dados)
+            print(f"[WEBSOCKET] Evento '{evento}' enviado: {dados.get('Produto', dados.get('produto_nome', 'N/A'))}")
+        except Exception as e:
+            print(f"[ERRO] Falha ao enviar via WebSocket: {e}")
+            import traceback
+            traceback.print_exc()
     
     def on_connect(self, client, userdata, flags, rc):
         """Callback quando conecta ao broker"""
@@ -131,11 +166,9 @@ class ServidorBackend:
     def on_message(self, client, userdata, msg):
         """Callback quando recebe uma mensagem"""
         try:
-            # Decodifica a mensagem JSON
             dados = json.loads(msg.payload.decode('utf-8'))
             topico = msg.topic
             
-            # Determina o tipo de mensagem (peso ou alerta)
             if 'alerta' in topico:
                 self.processar_alerta(dados)
             else:
@@ -143,54 +176,54 @@ class ServidorBackend:
                 
         except json.JSONDecodeError as e:
             print(f"[ERRO] Falha ao decodificar JSON: {e}")
-            print(f"[DEBUG] Mensagem recebida: {msg.payload.decode('utf-8')}")
-            print(f"[DEBUG] Tópico: {msg.topic}")
         except Exception as e:
             print(f"[ERRO] Erro ao processar mensagem: {e}")
-            print(f"[DEBUG] Tópico: {msg.topic}")
-            print(f"[DEBUG] Payload: {msg.payload.decode('utf-8', errors='ignore')}")
     
     def processar_medicao(self, dados):
         """Processa uma leitura de peso"""
+        produto_id = dados.get('produto_id')
+        
         with self.lock:
             self.leituras_recebidas += 1
-            prateleira_id = dados.get('prateleira_id')
-            sensor_id = dados.get('sensor_id')
-            peso = dados.get('peso_gramas', 0)
-            percentual = dados.get('percentual_restante', 0)
+            
+            # Verifica se produto existe nos cadastrados
+            if produto_id not in self.produtos_cadastrados:
+                print(f"[AVISO] Produto ID {produto_id} não cadastrado. Ignorando leitura.")
+                return
+            
+            produto_cadastrado = self.produtos_cadastrados[produto_id]
+            produto_nome = produto_cadastrado['nome']
+            peso_gramas = dados.get('peso_gramas', 0)
             timestamp = dados.get('timestamp', '')
             
-            # Armazena dados em memória
-            self.dados_prateleiras[prateleira_id][sensor_id] = {
-                'prateleira_id': prateleira_id,
-                'sensor_id': sensor_id,
-                'peso_atual': peso,
-                'peso_inicial': dados.get('peso_inicial', 0),
-                'percentual_restante': percentual,
-                'timestamp': timestamp,
-                'timestamp_recebimento': datetime.now().isoformat()
+            # Converte gramas para KG
+            peso_atual_kg = peso_gramas / 1000
+            peso_minimo_kg = produto_cadastrado['pesoMinimo']
+            peso_maximo_kg = produto_cadastrado['pesoMaximo']
+            peso_ideal_kg = produto_cadastrado.get('pesoIdeal', peso_minimo_kg * 2)
+            
+            # Calcula estado
+            estado = self._calcular_estado(peso_atual_kg, peso_minimo_kg, peso_ideal_kg)
+            
+            # Prepara dados para WebSocket (formato especificado)
+            dados_produto = {
+                'Produto': produto_nome,
+                'nivelEstoque': round(peso_atual_kg, 2),
+                'pesoMinimo': peso_minimo_kg,
+                'pesoMaximo': peso_maximo_kg,
+                'pesoAtual': round(peso_atual_kg, 2),
+                'ultimaAtualizacao': timestamp
             }
             
-            # Adiciona ao histórico (mantém últimas 100 leituras)
-            self.historico[prateleira_id][sensor_id].append({
-                'peso': peso,
-                'percentual': percentual,
-                'timestamp': timestamp
-            })
-            if len(self.historico[prateleira_id][sensor_id]) > 100:
-                self.historico[prateleira_id][sensor_id].pop(0)
-            
-            # Remove alerta se peso voltou ao normal
-            self.alertas_ativos = [
-                a for a in self.alertas_ativos 
-                if not (a.get('prateleira_id') == prateleira_id and a.get('sensor_id') == sensor_id)
-            ]
+            # Armazena dados do produto
+            self.produtos_dados[produto_id] = dados_produto
+        
+        # Envia via WebSocket (fora do lock para evitar deadlock)
+        self._enviar_via_websocket('produto_atualizado', dados_produto)
         
         # Exibe no console
         print(f"\n[📊 LEITURA #{self.leituras_recebidas}]")
-        print(f"   Prateleira: {prateleira_id} | Sensor: {sensor_id}")
-        print(f"   Peso: {peso:.2f}g | Percentual restante: {percentual:.1f}%")
-        print(f"   Timestamp: {timestamp}")
+        print(f"   {produto_nome}: {peso_atual_kg:.2f}kg - Estado: {estado}")
 
         self.salvar_csv(dados, tipo='peso')
     
@@ -198,48 +231,108 @@ class ServidorBackend:
         """Processa um alerta de reposição"""
         with self.lock:
             self.alertas_recebidos += 1
-            prateleira_id = dados.get('prateleira_id')
-            sensor_id = dados.get('sensor_id')
+            produto_id = dados.get('produto_id')
+            
+            if produto_id not in self.produtos_cadastrados:
+                return
+            
+            produto_cadastrado = self.produtos_cadastrados[produto_id]
+            produto_nome = produto_cadastrado['nome']
             peso_atual = dados.get('peso_atual', 0)
+            peso_critico = dados.get('peso_critico', 0)
             mensagem = dados.get('mensagem', 'Alerta de reposição')
             timestamp = dados.get('timestamp', '')
             
-            # Adiciona alerta à lista (remove duplicatas do mesmo sensor)
             alerta = {
-                'prateleira_id': prateleira_id,
-                'sensor_id': sensor_id,
-                'peso_atual': peso_atual,
-                'peso_critico': dados.get('peso_critico', 0),
+                'produto_id': produto_id,
+                'produto_nome': produto_nome,
+                'peso_atual': round(peso_atual / 1000, 2),
+                'peso_critico': round(peso_critico / 1000, 2),
                 'tipo': dados.get('tipo', 'REPOSICAO_URGENTE'),
                 'mensagem': mensagem,
-                'timestamp': timestamp,
-                'timestamp_recebimento': datetime.now().isoformat()
+                'timestamp': timestamp
             }
             
-            # Remove alerta anterior do mesmo sensor se existir
-            self.alertas_ativos = [
-                a for a in self.alertas_ativos 
-                if not (a.get('prateleira_id') == prateleira_id and a.get('sensor_id') == sensor_id)
-            ]
-            self.alertas_ativos.append(alerta)
+        
+        # Envia alerta via WebSocket (fora do lock)
+        self._enviar_via_websocket('alerta', alerta)
         
         # Exibe alerta destacado
         print(f"\n{'=' * 70}")
         print(f"⚠️  [ALERTA #{self.alertas_recebidos}] ⚠️")
         print(f"{'=' * 70}")
         print(f"   {mensagem}")
-        print(f"   Prateleira: {prateleira_id} | Sensor: {sensor_id}")
-        print(f"   Peso atual: {peso_atual:.2f}g")
+        print(f"   Produto: {produto_nome}")
+        print(f"   Peso atual: {alerta['peso_atual']:.2f}kg")
         print(f"   Timestamp: {timestamp}")
         print(f"{'=' * 70}\n")
 
         self.salvar_csv(dados, tipo='alerta')
+    
+    def _conectar_publisher(self):
+        """Conecta o cliente MQTT publisher para simulações manuais"""
+        def on_connect_pub(client, userdata, flags, rc):
+            if rc == 0:
+                self.client_publisher_connected = True
+                print(f"[PUBLISHER] Cliente MQTT publisher conectado")
+            else:
+                self.client_publisher_connected = False
+        
+        try:
+            self.client_publisher.on_connect = on_connect_pub
+            self.client_publisher.connect(self.broker_host, self.broker_port, 60)
+            self.client_publisher.loop_start()
+            # Aguarda conexão
+            for i in range(10):
+                if self.client_publisher_connected:
+                    break
+                time.sleep(0.2)
+            return self.client_publisher_connected
+        except Exception as e:
+            print(f"[ERRO] Falha ao conectar publisher: {e}")
+            return False
+    
+    def _publicar_simulacao(self, produto_id, peso_novo_kg):
+        """Publica uma mensagem MQTT simulando uma leitura de sensor"""
+        if produto_id not in self.produtos_cadastrados:
+            return False
+        
+        produto = self.produtos_cadastrados[produto_id]
+        topic = produto['topic']
+        peso_gramas = peso_novo_kg * 1000
+        peso_inicial = produto['pesoMaximo'] * 1000
+        percentual_restante = (peso_gramas / peso_inicial) * 100 if peso_inicial > 0 else 0
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        
+        dados = {
+            "produto_id": produto_id,
+            "produto_nome": produto['nome'],
+            "peso_gramas": round(peso_gramas, 2),
+            "peso_inicial": peso_inicial,
+            "percentual_restante": round(percentual_restante, 2),
+            "timestamp": timestamp
+        }
+        
+        mensagem = json.dumps(dados, ensure_ascii=False)
+        try:
+            result = self.client_publisher.publish(topic, mensagem, qos=1)
+            if result.rc == mqtt.MQTT_ERR_SUCCESS:
+                print(f"[SIMULAÇÃO] Publicada leitura para {produto['nome']}: {peso_novo_kg:.2f}kg")
+                return True
+            else:
+                print(f"[ERRO] Falha ao publicar simulação. Código: {result.rc}")
+                return False
+        except Exception as e:
+            print(f"[ERRO] Erro ao publicar simulação: {e}")
+            return False
     
     def conectar(self):
         """Conecta ao broker MQTT"""
         try:
             self.client.connect(self.broker_host, self.broker_port, 60)
             self.client.loop_start()
+            # Conecta também o publisher
+            self._conectar_publisher()
             return True
         except Exception as e:
             print(f"[ERRO] Não foi possível conectar ao broker: {e}")
@@ -250,112 +343,239 @@ class ServidorBackend:
         """Configura as rotas da API REST"""
         
         @self.app.route('/api/ping', methods=['GET'])
-        def health():
+        def ping():
             return jsonify({'status': 'ok', 'message': 'pong'})
         
-        @self.app.route('/api/prateleiras', methods=['GET'])
-        def listar_prateleiras():
-            with self.lock:
-                prateleiras = {}
-                for prateleira_id, sensores in self.dados_prateleiras.items():
-                    prateleiras[prateleira_id] = {
-                        'prateleira_id': prateleira_id,
-                        'num_sensores': len(sensores),
-                        'sensores': list(sensores.keys())
+        @self.app.route('/api/produtos', methods=['POST'])
+        def cadastrar_produto():
+            """Cadastra um novo produto para simulação"""
+            try:
+                data = request.get_json()
+                
+                # Validação dos campos obrigatórios
+                if not data or 'nome' not in data:
+                    return jsonify({'erro': 'Campo "nome" é obrigatório'}), 400
+                
+                nome = data.get('nome')
+                peso_minimo = float(data.get('pesoMinimo', 100))  # KG
+                peso_maximo = float(data.get('pesoMaximo', 1000))  # KG
+                peso_ideal = float(data.get('pesoIdeal', peso_minimo * 2))  # KG
+                topic = data.get('topic', None)  # Opcional
+                
+                # Validação de valores
+                if peso_minimo <= 0 or peso_maximo <= 0 or peso_ideal <= 0:
+                    return jsonify({'erro': 'Pesos devem ser maiores que zero'}), 400
+                
+                if peso_minimo >= peso_maximo:
+                    return jsonify({'erro': 'pesoMinimo deve ser menor que pesoMaximo'}), 400
+                
+                if peso_ideal < peso_minimo or peso_ideal > peso_maximo:
+                    return jsonify({'erro': 'pesoIdeal deve estar entre pesoMinimo e pesoMaximo'}), 400
+                
+                with self.lock:
+                    produto_id = self.next_produto_id
+                    self.next_produto_id += 1
+                    
+                    produto = {
+                        'produto_id': produto_id,
+                        'nome': nome,
+                        'pesoMinimo': peso_minimo,
+                        'pesoMaximo': peso_maximo,
+                        'pesoIdeal': peso_ideal,
+                        'topic': topic if topic else f"{TOPIC_BASE}/produto{produto_id}/peso"
                     }
-                return jsonify(list(prateleiras.values()))
-        
-        @self.app.route('/api/prateleiras/<int:prateleira_id>', methods=['GET'])
-        def obter_prateleira(prateleira_id):
-            with self.lock:
-                if prateleira_id not in self.dados_prateleiras:
-                    return jsonify({'erro': 'Prateleira não encontrada'}), 404
+                    
+                    self.produtos_cadastrados[produto_id] = produto
+                    
+                    print(f"[INFO] Produto cadastrado: ID {produto_id} - {nome}")
                 
-                sensores = []
-                for sensor_id, dados in self.dados_prateleiras[prateleira_id].items():
-                    sensores.append(dados)
+                return jsonify(produto), 201
                 
-                return jsonify({
-                    'prateleira_id': prateleira_id,
-                    'num_sensores': len(sensores),
-                    'sensores': sensores
-                })
+            except ValueError as e:
+                return jsonify({'erro': f'Valor inválido: {str(e)}'}), 400
+            except Exception as e:
+                return jsonify({'erro': f'Erro ao cadastrar produto: {str(e)}'}), 500
         
-        @self.app.route('/api/sensores', methods=['GET'])
-        def listar_sensores():
+        @self.app.route('/api/produtos', methods=['GET'])
+        def listar_produtos_cadastrados():
+            """Lista todos os produtos cadastrados"""
             with self.lock:
-                sensores = []
-                for prateleira_id, sensores_data in self.dados_prateleiras.items():
-                    for sensor_id, dados in sensores_data.items():
-                        sensores.append(dados)
-                return jsonify(sensores)
+                produtos = list(self.produtos_cadastrados.values())
+                return jsonify(produtos)
         
-        @self.app.route('/api/sensores/<int:prateleira_id>/<int:sensor_id>', methods=['GET'])
-        def obter_sensor(prateleira_id, sensor_id):
+        @self.app.route('/api/produtos/<int:produto_id>', methods=['DELETE'])
+        def remover_produto(produto_id):
+            """Remove um produto cadastrado"""
             with self.lock:
-                if (prateleira_id not in self.dados_prateleiras or 
-                    sensor_id not in self.dados_prateleiras[prateleira_id]):
-                    return jsonify({'erro': 'Sensor não encontrado'}), 404
+                if produto_id not in self.produtos_cadastrados:
+                    return jsonify({'erro': 'Produto não encontrado'}), 404
                 
-                dados = self.dados_prateleiras[prateleira_id][sensor_id].copy()
-                if prateleira_id in self.historico and sensor_id in self.historico[prateleira_id]:
-                    dados['historico'] = self.historico[prateleira_id][sensor_id][-20:]  # Últimas 20 leituras
+                produto = self.produtos_cadastrados.pop(produto_id)
+                if produto_id in self.produtos_dados:
+                    del self.produtos_dados[produto_id]
                 
-                return jsonify(dados)
+                print(f"[INFO] Produto removido: ID {produto_id} - {produto['nome']}")
+                return jsonify({'mensagem': 'Produto removido com sucesso'}), 200
         
-        @self.app.route('/api/alertas', methods=['GET'])
-        def listar_alertas():
-            with self.lock:
-                return jsonify(self.alertas_ativos)
+        @self.app.route('/api/produtos/<int:produto_id>/retirada', methods=['POST'])
+        def simular_retirada(produto_id):
+            """Simula retirada manual de produtos"""
+            try:
+                data = request.get_json() or {}
+                quantidade_kg = float(data.get('quantidade', 0))  # Quantidade em KG
+                
+                with self.lock:
+                    if produto_id not in self.produtos_cadastrados:
+                        return jsonify({'erro': 'Produto não encontrado'}), 404
+                    
+                    produto = self.produtos_cadastrados[produto_id]
+                    
+                    # Obtém peso atual do produto (se existir)
+                    if produto_id in self.produtos_dados:
+                        peso_atual_kg = self.produtos_dados[produto_id].get('pesoAtual', produto['pesoMaximo'])
+                    else:
+                        peso_atual_kg = produto['pesoMaximo']
+                    
+                    # Se quantidade não foi especificada, usa valor aleatório (5-15% do peso atual)
+                    if quantidade_kg <= 0:
+                        quantidade_kg = peso_atual_kg * random.uniform(0.05, 0.15)
+                    
+                    # Calcula novo peso
+                    peso_novo_kg = max(0, peso_atual_kg - quantidade_kg)
+                
+                # Publica mensagem MQTT simulada
+                if self._publicar_simulacao(produto_id, peso_novo_kg):
+                    return jsonify({
+                        'mensagem': 'Retirada simulada com sucesso',
+                        'produto_id': produto_id,
+                        'produto_nome': produto['nome'],
+                        'peso_anterior': round(peso_atual_kg, 2),
+                        'quantidade_retirada': round(quantidade_kg, 2),
+                        'peso_novo': round(peso_novo_kg, 2)
+                    }), 200
+                else:
+                    return jsonify({'erro': 'Falha ao publicar simulação MQTT'}), 500
+                    
+            except ValueError as e:
+                return jsonify({'erro': f'Valor inválido: {str(e)}'}), 400
+            except Exception as e:
+                return jsonify({'erro': f'Erro ao simular retirada: {str(e)}'}), 500
         
-        @self.app.route('/api/estatisticas', methods=['GET'])
-        def obter_estatisticas():
-            with self.lock:
-                total_prateleiras = len(self.dados_prateleiras)
-                total_sensores = sum(len(sensores) for sensores in self.dados_prateleiras.values())
-                return jsonify({
-                    'leituras_recebidas': self.leituras_recebidas,
-                    'alertas_recebidos': self.alertas_recebidos,
-                    'alertas_ativos': len(self.alertas_ativos),
-                    'total_prateleiras': total_prateleiras,
-                    'total_sensores': total_sensores
-                })
+        @self.app.route('/api/produtos/<int:produto_id>/reposicao', methods=['POST'])
+        def simular_reposicao(produto_id):
+            """Simula reposição manual de produtos"""
+            try:
+                data = request.get_json() or {}
+                quantidade_kg = float(data.get('quantidade', 0))  # Quantidade em KG
+                
+                with self.lock:
+                    if produto_id not in self.produtos_cadastrados:
+                        return jsonify({'erro': 'Produto não encontrado'}), 404
+                    
+                    produto = self.produtos_cadastrados[produto_id]
+                    
+                    # Obtém peso atual do produto (se existir)
+                    if produto_id in self.produtos_dados:
+                        peso_atual_kg = self.produtos_dados[produto_id].get('pesoAtual', 0)
+                    else:
+                        peso_atual_kg = 0
+                    
+                    # Se quantidade não foi especificada, usa valor aleatório (1-5kg)
+                    if quantidade_kg <= 0:
+                        quantidade_kg = random.uniform(1, 5)
+                    
+                    # Calcula novo peso (não ultrapassa o máximo)
+                    peso_novo_kg = min(produto['pesoMaximo'], peso_atual_kg + quantidade_kg)
+                
+                # Publica mensagem MQTT simulada
+                if self._publicar_simulacao(produto_id, peso_novo_kg):
+                    return jsonify({
+                        'mensagem': 'Reposição simulada com sucesso',
+                        'produto_id': produto_id,
+                        'produto_nome': produto['nome'],
+                        'peso_anterior': round(peso_atual_kg, 2),
+                        'quantidade_adicionada': round(quantidade_kg, 2),
+                        'peso_novo': round(peso_novo_kg, 2)
+                    }), 200
+                else:
+                    return jsonify({'erro': 'Falha ao publicar simulação MQTT'}), 500
+                    
+            except ValueError as e:
+                return jsonify({'erro': f'Valor inválido: {str(e)}'}), 400
+            except Exception as e:
+                return jsonify({'erro': f'Erro ao simular reposição: {str(e)}'}), 500
+    
+    def _configurar_websocket(self):
+        """Configura eventos do WebSocket"""
+        
+        @self.socketio.on('connect')
+        def handle_connect(auth):
+            print(f"[WEBSOCKET] Cliente conectado (auth: {auth})")
+            try:
+                # Obtém lista de produtos
+                with self.lock:
+                    produtos_list = list(self.produtos_dados.values())
+                    num_produtos = len(produtos_list)
+                
+                # Emite para o cliente que acabou de conectar
+                # No handler de connect, emit sem broadcast envia apenas para o cliente atual
+                if num_produtos > 0:
+                    print(f"[WEBSOCKET] Enviando {num_produtos} produto(s) iniciais")
+                    emit('produtos_iniciais', produtos_list)
+                else:
+                    print(f"[WEBSOCKET] Nenhum produto com dados ainda. Enviando lista vazia para confirmar conexão.")
+                    emit('produtos_iniciais', [])
+                    # Envia também uma mensagem de teste
+                    emit('teste', {'mensagem': 'WebSocket funcionando!'})
+            except Exception as e:
+                print(f"[ERRO] Falha ao enviar produtos iniciais: {e}")
+                import traceback
+                traceback.print_exc()
+        
+        @self.socketio.on('disconnect')
+        def handle_disconnect():
+            print(f"[WEBSOCKET] Cliente desconectado")
+        
+        @self.socketio.on_error_default
+        def default_error_handler(e):
+            print(f"[WEBSOCKET] Erro: {e}")
+            import traceback
+            traceback.print_exc()
     
     def _iniciar_api(self):
-        """Inicia o servidor Flask em thread separada"""
+        """Inicia o servidor Flask + SocketIO em thread separada"""
         def run_api():
-            self.app.run(host=self.api_host, port=self.api_port, debug=False, use_reloader=False)
+            self.socketio.run(self.app, host=self.api_host, port=self.api_port, 
+                            debug=False, allow_unsafe_werkzeug=True, use_reloader=False)
         
         thread = Thread(target=run_api, daemon=True)
         thread.start()
-        print(f"[API] Servidor REST iniciado em http://{self.api_host}:{self.api_port}")
+        print(f"[API] Servidor iniciado em http://{self.api_host}:{self.api_port}")
+        print(f"[API] WebSocket disponível em ws://{self.api_host}:{self.api_port}")
         print(f"[API] Endpoints disponíveis:")
-        print(f"       GET /api/health - Status do servidor")
-        print(f"       GET /api/prateleiras - Lista todas as prateleiras")
-        print(f"       GET /api/prateleiras/<id> - Dados de uma prateleira")
-        print(f"       GET /api/sensores - Lista todos os sensores")
-        print(f"       GET /api/sensores/<prateleira_id>/<sensor_id> - Dados de um sensor")
-        print(f"       GET /api/alertas - Lista alertas ativos")
-        print(f"       GET /api/estatisticas - Estatísticas gerais")
+        print(f"       GET  /api/ping - Status do servidor")
+        print(f"       POST /api/produtos - Cadastrar produto")
+        print(f"       GET  /api/produtos - Listar produtos cadastrados")
+        print(f"       DELETE /api/produtos/<id> - Remover produto")
     
     def executar(self):
-        """Executa o servidor backend (MQTT + API)"""
+        """Executa o servidor backend (MQTT + WebSocket)"""
         print("=" * 70)
-        print("SERVIDOR BACKEND - MQTT + API REST")
+        print("SERVIDOR BACKEND - MQTT + WebSocket")
         print("=" * 70)
         print(f"Broker MQTT: {self.broker_host}:{self.broker_port}")
         print(f"Tópico: {TOPIC_SUBSCRIBE}")
-        print(f"API REST: http://{self.api_host}:{self.api_port}")
+        print(f"API/WebSocket: http://{self.api_host}:{self.api_port}")
         print(f"Arquivo CSV: {self.arquivo_csv}")
         print("=" * 70)
         
-        # Inicia API REST
+        # Inicia API/WebSocket
         self._iniciar_api()
+        time.sleep(2)  # Aguarda servidor iniciar
         
         if self.conectar():
             try:
                 print("\n[INFO] Backend ativo. Pressione Ctrl+C para parar.\n")
-                # Mantém o programa rodando
                 while True:
                     time.sleep(1)
             except KeyboardInterrupt:
@@ -365,6 +585,9 @@ class ServidorBackend:
                 print(f"[INFO] Dados salvos em: {self.arquivo_csv}")
                 self.client.loop_stop()
                 self.client.disconnect()
+                if self.client_publisher_connected:
+                    self.client_publisher.loop_stop()
+                    self.client_publisher.disconnect()
                 print("[INFO] Servidor encerrado.")
         else:
             print("[ERRO] Não foi possível iniciar o servidor.")
@@ -372,7 +595,7 @@ class ServidorBackend:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Servidor backend que recebe dados MQTT e expõe API REST"
+        description="Servidor backend que recebe dados MQTT e expõe WebSocket"
     )
     parser.add_argument(
         "--broker",
@@ -393,13 +616,13 @@ def main():
     parser.add_argument(
         "--api-host",
         default=API_HOST,
-        help=f"Host da API REST (padrão: {API_HOST})"
+        help=f"Host da API/WebSocket (padrão: {API_HOST})"
     )
     parser.add_argument(
         "--api-port",
         type=int,
         default=API_PORT,
-        help=f"Porta da API REST (padrão: {API_PORT})"
+        help=f"Porta da API/WebSocket (padrão: {API_PORT})"
     )
     
     args = parser.parse_args()
