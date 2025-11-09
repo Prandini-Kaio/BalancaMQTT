@@ -141,10 +141,13 @@ class ServidorBackend:
         """Envia dados via WebSocket para todos os clientes conectados"""
         try:
             # Envia para todos os clientes conectados (sem room = broadcast para todos)
+            # Não precisa especificar namespace quando usando socketio.emit diretamente
             self.socketio.emit(evento, dados)
-            print(f"[WEBSOCKET] Evento '{evento}' enviado: {dados.get('Produto', dados.get('produto_nome', 'N/A'))}")
+            # Tenta obter o nome do produto de diferentes formas possíveis
+            nome_produto = dados.get('produto') or dados.get('produto_nome') or dados.get('Produto') or 'N/A'
+            print(f"[WEBSOCKET] ✅ Evento '{evento}' enviado: {nome_produto}")
         except Exception as e:
-            print(f"[ERRO] Falha ao enviar via WebSocket: {e}")
+            print(f"[ERRO] ❌ Falha ao enviar via WebSocket: {e}")
             import traceback
             traceback.print_exc()
     
@@ -467,7 +470,7 @@ class ServidorBackend:
                     
                     # Obtém peso atual do produto (se existir)
                     if produto_id in self.produtos_dados:
-                        peso_atual_kg = self.produtos_dados[produto_id].get('pesoAtual', produto['pesoMaximo'])
+                        peso_atual_kg = self.produtos_dados[produto_id].get('peso_atual', produto['pesoMaximo'])
                     else:
                         peso_atual_kg = produto['pesoMaximo']
                     
@@ -481,7 +484,28 @@ class ServidorBackend:
                 # 1. Atualiza o sensor no publicador (reflete na balança real)
                 sensor_atualizado = self._atualizar_sensor_publicador(produto_id, quantidade_kg, 'retirada')
                 
-                # 2. Publica mensagem MQTT (o sensor também publicará na próxima iteração)
+                # 2. Atualiza dados localmente e envia via WebSocket imediatamente
+                timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+                peso_minimo_kg = produto['pesoMinimo']
+                peso_maximo_kg = produto['pesoMaximo']
+                peso_ideal_kg = produto.get('pesoIdeal', peso_minimo_kg * 2)
+                
+                dados_produto = {
+                    'produto': produto['nome'],
+                    'peso_minimo': peso_minimo_kg,
+                    'peso_maximo': peso_maximo_kg,
+                    'peso_atual': round(peso_novo_kg, 2),
+                    'peso_ideal': round(peso_ideal_kg, 2),
+                    'ultima_atualizacao': timestamp
+                }
+                
+                with self.lock:
+                    self.produtos_dados[produto_id] = dados_produto
+                
+                # Envia atualização via WebSocket
+                self._enviar_via_websocket('produto_atualizado', dados_produto)
+                
+                # 3. Publica mensagem MQTT (o sensor também publicará na próxima iteração)
                 mqtt_publicado = self._publicar_simulacao(produto_id, peso_novo_kg)
                 
                 if sensor_atualizado or mqtt_publicado:
@@ -517,7 +541,7 @@ class ServidorBackend:
                     produto = self.produtos_cadastrados[produto_id]
 
                     if produto_id in self.produtos_dados:
-                        peso_atual_kg = self.produtos_dados[produto_id].get('pesoAtual', 0)
+                        peso_atual_kg = self.produtos_dados[produto_id].get('peso_atual', 0)
                     else:
                         peso_atual_kg = 0
 
@@ -528,7 +552,31 @@ class ServidorBackend:
                     # Calcula novo peso sem ultrapassar o máximo
                     peso_novo_kg = min(produto['pesoMaximo'], peso_atual_kg + quantidade_kg)
 
+                # 1. Atualiza o sensor no publicador (reflete na balança real)
                 sensor_atualizado = self._atualizar_sensor_publicador(produto_id, quantidade_kg, 'reposicao')
+                
+                # 2. Atualiza dados localmente e envia via WebSocket imediatamente
+                timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+                peso_minimo_kg = produto['pesoMinimo']
+                peso_maximo_kg = produto['pesoMaximo']
+                peso_ideal_kg = produto.get('pesoIdeal', peso_minimo_kg * 2)
+                
+                dados_produto = {
+                    'produto': produto['nome'],
+                    'peso_minimo': peso_minimo_kg,
+                    'peso_maximo': peso_maximo_kg,
+                    'peso_atual': round(peso_novo_kg, 2),
+                    'peso_ideal': round(peso_ideal_kg, 2),
+                    'ultima_atualizacao': timestamp
+                }
+                
+                with self.lock:
+                    self.produtos_dados[produto_id] = dados_produto
+                
+                # Envia atualização via WebSocket
+                self._enviar_via_websocket('produto_atualizado', dados_produto)
+                
+                # 3. Publica mensagem MQTT (o sensor também publicará na próxima iteração)
                 mqtt_publicado = self._publicar_simulacao(produto_id, peso_novo_kg)
                 
                 if sensor_atualizado or mqtt_publicado:
@@ -554,8 +602,8 @@ class ServidorBackend:
         """Configura eventos do WebSocket"""
         
         @self.socketio.on('connect')
-        def handle_connect(auth):
-            print(f"[WEBSOCKET] Cliente conectado (auth: {auth})")
+        def handle_connect():
+            print(f"[WEBSOCKET] ✅ Cliente conectado")
             try:
                 # Obtém lista de produtos
                 with self.lock:
@@ -563,14 +611,15 @@ class ServidorBackend:
                     num_produtos = len(produtos_list)
 
                 if num_produtos > 0:
-                    print(f"[WEBSOCKET] Enviando {num_produtos} produto(s) iniciais")
+                    print(f"[WEBSOCKET] 📦 Enviando {num_produtos} produto(s) iniciais")
                     emit('produtos_iniciais', produtos_list)
+                    print(f"[WEBSOCKET] ✅ Produtos iniciais enviados")
                 else:
-                    print(f"[WEBSOCKET] Nenhum produto com dados ainda. Enviando lista vazia para confirmar conexão.")
+                    print(f"[WEBSOCKET] ⚠️ Nenhum produto com dados ainda. Enviando lista vazia.")
                     emit('produtos_iniciais', [])
                     emit('teste', {'mensagem': 'WebSocket funcionando!'})
             except Exception as e:
-                print(f"[ERRO] Falha ao enviar produtos iniciais: {e}")
+                print(f"[ERRO] ❌ Falha ao enviar produtos iniciais: {e}")
                 import traceback
                 traceback.print_exc()
         
