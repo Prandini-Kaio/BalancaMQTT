@@ -8,29 +8,93 @@ Sistema completo de monitoramento de estoque usando sensores de peso que se comu
 - ✅ Publicação contínua de leituras via MQTT
 - ✅ Detecção automática de níveis críticos de estoque
 - ✅ Alertas de reposição em tempo real
-- ✅ Armazenamento de dados em arquivo CSV
+- ✅ **Persistência de dados em banco de dados PostgreSQL**
+- ✅ Armazenamento de backup em arquivo CSV
 - ✅ API REST para acesso aos dados pelo frontend
+- ✅ WebSocket para atualizações em tempo real
 - ✅ Métricas gerais do sistema (total de produtos, estados, etc.)
 - ✅ Estados de estoque: CRÍTICO, BAIXO, IDEAL
+- ✅ **Dockerização completa do sistema**
 
 ## 🛠️ Tecnologias
 
-- **Python 3.7+**
+- **Python 3.11+**
 - **Paho-MQTT** - Biblioteca cliente MQTT
 - **Flask** - Framework web para API REST
+- **Flask-SocketIO** - WebSocket para comunicação em tempo real
 - **Flask-CORS** - CORS para API
-- **CSV** - Armazenamento de dados
+- **SQLAlchemy** - ORM para banco de dados
+- **PostgreSQL** - Banco de dados relacional
+- **Docker & Docker Compose** - Containerização
+- **CSV** - Backup de dados
 - **JSON** - Formato de mensagens
 
 ## 📦 Instalação
 
-### 1. Instalar dependências
+### Opção 1: Docker 🐳
+
+A forma mais fácil de executar o sistema é usando Docker Compose:
+
+```bash
+# Clonar ou baixar o projeto
+cd BalancaMQTT
+
+# Iniciar todos os serviços (PostgreSQL + Backend + Publicador)
+docker-compose up -d
+
+# Ver logs
+docker-compose logs -f
+
+# Parar os serviços
+docker-compose down
+```
+
+**Serviços disponíveis:**
+- **Backend**: http://localhost:5000
+- **Publicador**: http://localhost:5001
+- **PostgreSQL**: localhost:5432
+
+**Variáveis de ambiente** podem ser configuradas no arquivo `.env` ou no `docker-compose.yml`.
+
+### Opção 2: Instalação Manual
+
+#### 1. Instalar dependências
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### 2. Instalar e configurar um broker MQTT
+#### 2. Configurar banco de dados PostgreSQL
+
+Instale e configure o PostgreSQL, depois crie o banco:
+
+```bash
+# Criar banco de dados
+createdb balancas_db
+
+# Ou via psql
+psql -U postgres -c "CREATE DATABASE balancas_db;"
+```
+
+Configure a variável de ambiente `DATABASE_URL`:
+
+```bash
+export DATABASE_URL="postgresql://usuario:senha@localhost:5432/balancas_db"
+```
+
+Ou crie um arquivo `.env`:
+
+```bash
+DATABASE_URL=postgresql://usuario:senha@localhost:5432/balancas_db
+```
+
+#### 3. Inicializar banco de dados
+
+```bash
+python init_db.py
+```
+
+#### 3. Instalar e configurar um broker MQTT
 
 #### Opção A: Mosquitto (Recomendado)
 
@@ -58,7 +122,25 @@ Você pode usar um broker público como:
 
 ## 🚀 Como Usar
 
-### 1. Iniciar o Servidor Backend
+### Com Docker
+
+```bash
+# Iniciar tudo
+docker-compose up -d
+
+# Ver logs do backend
+docker-compose logs -f backend
+
+# Ver logs do publicador
+docker-compose logs -f publicador
+
+# Ver logs do banco
+docker-compose logs -f postgres
+```
+
+### Manualmente
+
+#### 1. Iniciar o Servidor Backend
 
 Abra um terminal e execute:
 
@@ -67,13 +149,16 @@ python src/servidor_assinante.py
 ```
 
 O servidor irá:
+- Conectar ao banco de dados PostgreSQL
+- Criar tabelas automaticamente (se não existirem)
 - Conectar ao broker MQTT
 - Inscrever-se nos tópicos de estoque
 - Exibir leituras recebidas no console
-- Salvar dados no arquivo `dados.csv`
+- Salvar dados no banco de dados e arquivo `dados.csv` (backup)
 - Iniciar API REST em `http://localhost:5000`
+- Iniciar WebSocket em `ws://localhost:5000`
 
-### 2. Iniciar os Sensores (Publicador)
+#### 2. Iniciar os Sensores (Publicador)
 
 Abra outro terminal e execute:
 
@@ -380,12 +465,37 @@ BalancaMQTT/
 │
 ├── src/
 │   ├── balancas_publicador.py    # Simula sensores de peso (publicador)
-│   └── servidor_assinante.py     # Servidor backend (assinante + API)
+│   ├── servidor_assinante.py     # Servidor backend (assinante + API)
+│   ├── models.py                 # Modelos SQLAlchemy (Produto, Leitura, Alerta)
+│   └── config.py                 # Configurações do sistema
 ├── requirements.txt              # Dependências Python
+├── Dockerfile.backend            # Dockerfile para o backend
+├── Dockerfile.publicador         # Dockerfile para o publicador
+├── docker-compose.yml            # Orquestração Docker Compose
+├── init_db.py                    # Script de inicialização do banco
+├── .dockerignore                 # Arquivos ignorados no Docker
 ├── README.md                     # Este arquivo
 ├── API_DOCS.md                   # Documentação da API REST do backend
-├── PUBLICADOR_API_DOCS.md        # Documentação da API REST do publicador
-└── dados.csv                     # Dados salvos (gerado automaticamente)
+└── dados.csv                     # Backup CSV (gerado automaticamente)
+```
+
+## 🗄️ Banco de Dados
+
+O sistema utiliza PostgreSQL para persistência de dados com as seguintes tabelas:
+
+- **`produtos`**: Cadastro de produtos (nome, pesos, tópico MQTT)
+- **`leituras`**: Histórico de todas as leituras de peso recebidas
+- **`alertas`**: Histórico de alertas de reposição
+
+O banco é inicializado automaticamente na primeira execução. Para reinicializar:
+
+```bash
+# Com Docker
+docker-compose down -v  # Remove volumes
+docker-compose up -d    # Recria tudo
+
+# Manualmente
+python init_db.py
 ```
 
 Agradecemos às seguintes pessoas que contribuíram para este projeto:

@@ -1,0 +1,81 @@
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: balancas_postgres
+    environment:
+      POSTGRES_USER: balanca
+      POSTGRES_PASSWORD: balanca123
+      POSTGRES_DB: balancas_db
+      POSTGRES_INITDB_ARGS: "-E UTF8 --locale=pt_BR.UTF-8"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U balanca -d balancas_db || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    networks:
+      - balancas_network
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: balancas_backend
+    environment:
+      DATABASE_URL: postgresql://balanca:balanca123@postgres:5432/balancas_db
+      BROKER_HOST: ${BROKER_HOST:-test.mosquitto.org}
+      BROKER_PORT: ${BROKER_PORT:-1883}
+      API_HOST: 0.0.0.0
+      API_PORT: 5000
+      PUBLICADOR_API_URL: http://publicador:5001
+      TOPIC_BASE: estoque
+    ports:
+      - "5000:5000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./dados.csv:/app/dados.csv
+    networks:
+      - balancas_network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/api/ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  publicador:
+    build:
+      context: .
+      dockerfile: Dockerfile.publicador
+    container_name: balancas_publicador
+    environment:
+      BROKER_HOST: ${BROKER_HOST:-test.mosquitto.org}
+      BROKER_PORT: ${BROKER_PORT:-1883}
+      API_URL: http://backend:5000
+      API_PORT_PUBLICADOR: 5001
+      TOPIC_BASE: estoque
+      INTERVALO_MEDICAO: 3
+      INTERVALO_VERIFICACAO_PRODUTOS: 10
+    ports:
+      - "5001:5001"
+    depends_on:
+      backend:
+        condition: service_started
+    networks:
+      - balancas_network
+    restart: unless-stopped
+
+networks:
+  balancas_network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+

@@ -3,19 +3,24 @@ import time
 import random
 import json
 import argparse
+import os
 import requests
 from threading import Thread, Lock
 from flask import Flask, jsonify, request
 from flask_cors import CORS
+from dotenv import load_dotenv
 
-# Config padrão
-BROKER_HOST = "test.mosquitto.org"
-BROKER_PORT = 1883
-TOPIC_BASE = "estoque"
-API_URL = "http://localhost:5000"
-INTERVALO_MEDICAO = 3
-INTERVALO_VERIFICACAO_PRODUTOS = 10
-API_PORT_PUBLICADOR = 5001
+# Carrega variáveis de ambiente
+load_dotenv()
+
+# Config padrão (com suporte a variáveis de ambiente)
+BROKER_HOST = os.getenv('BROKER_HOST', 'test.mosquitto.org')
+BROKER_PORT = int(os.getenv('BROKER_PORT', '1883'))
+TOPIC_BASE = os.getenv('TOPIC_BASE', 'estoque')
+API_URL = os.getenv('API_URL', 'http://localhost:5000')
+INTERVALO_MEDICAO = int(os.getenv('INTERVALO_MEDICAO', '3'))
+INTERVALO_VERIFICACAO_PRODUTOS = int(os.getenv('INTERVALO_VERIFICACAO_PRODUTOS', '10'))
+API_PORT_PUBLICADOR = int(os.getenv('API_PORT_PUBLICADOR', '5001'))
 
 
 """

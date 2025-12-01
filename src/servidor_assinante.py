@@ -11,16 +11,16 @@ from threading import Thread, Lock
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from flask_socketio import SocketIO, emit
+from sqlalchemy.exc import SQLAlchemyError
 
-# Config padrao
-BROKER_HOST = "test.mosquitto.org"
-BROKER_PORT = 1883
-TOPIC_BASE = "estoque"
+# Imports locais
+from models import db, Produto, Leitura, Alerta, init_db
+from config import (
+    DATABASE_URL, BROKER_HOST, BROKER_PORT, TOPIC_BASE,
+    API_HOST, API_PORT, PUBLICADOR_API_URL, ARQUIVO_CSV
+)
+
 TOPIC_SUBSCRIBE = f"{TOPIC_BASE}/#"
-ARQUIVO_CSV = "dados.csv"
-API_HOST = "0.0.0.0"
-API_PORT = 5000
-PUBLICADOR_API_URL = "http://localhost:5001"
 
 
 """
@@ -31,13 +31,14 @@ Recebe dados MQTT de sensores de produtos e expõe WebSocket para frontend
 class ServidorBackend:
     """Classe que gerencia o servidor coletor de dados MQTT"""
     
-    def __init__(self, broker_host, broker_port, arquivo_csv, api_host, api_port, publicador_api_url):
+    def __init__(self, broker_host, broker_port, arquivo_csv, api_host, api_port, publicador_api_url, database_url):
         self.broker_host = broker_host
         self.broker_port = broker_port
         self.arquivo_csv = arquivo_csv
         self.api_host = api_host
         self.api_port = api_port
         self.publicador_api_url = publicador_api_url
+        self.database_url = database_url
         
         # Cliente MQTT (assinante)
         self.client = mqtt.Client(client_id="servidor_coletor")
@@ -49,17 +50,26 @@ class ServidorBackend:
         self.client_publisher = mqtt.Client(client_id="servidor_coletor_publisher")
         self.client_publisher_connected = False
         
-        # Armazenamento em memória
+        # Armazenamento em memória (cache para WebSocket - dados em tempo real)
         self.lock = Lock()
-        self.leituras_recebidas = 0
-        self.alertas_recebidos = 0
-
-        self.produtos_cadastrados = {}
-        self.produtos_dados = {}
-        self.next_produto_id = 1
+        self.produtos_dados = {}  # Cache em memória para dados atuais (WebSocket)
         
         # Flask + SocketIO
         self.app = Flask(__name__)
+        
+        # Configuração do banco de dados
+        self.app.config['SQLALCHEMY_DATABASE_URI'] = database_url
+        self.app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+        db.init_app(self.app)
+        
+        # Inicializa banco de dados (com retry para aguardar PostgreSQL estar pronto)
+        try:
+            init_db(self.app)
+            print(f"[DB] ✅ Banco de dados conectado: {database_url.split('@')[-1] if '@' in database_url else database_url}")
+        except Exception as e:
+            print(f"[DB] ⚠️ Aviso: Erro ao inicializar banco: {e}")
+            print(f"[DB] ⚠️ O sistema continuará, mas algumas funcionalidades podem não funcionar até o banco estar disponível")
+        
         CORS(self.app)
         self.socketio = SocketIO(
             self.app, 
@@ -71,7 +81,46 @@ class ServidorBackend:
         self._configurar_rotas()
         self._configurar_websocket()
         
+        # Carrega produtos do banco na inicialização
+        self._carregar_produtos_do_banco()
+        
         self.inicializar_csv()
+    
+    def _carregar_produtos_do_banco(self):
+        """Carrega produtos cadastrados do banco de dados na inicialização"""
+        try:
+            with self.app.app_context():
+                produtos = Produto.query.all()
+                print(f"[DB] ✅ Carregados {len(produtos)} produto(s) do banco de dados")
+                for produto in produtos:
+                    print(f"[DB]   - ID {produto.produto_id}: {produto.nome} (tópico: {produto.topic})")
+                    # Carrega última leitura para dados em tempo real
+                    ultima_leitura = Leitura.query.filter_by(produto_id=produto.produto_id).order_by(Leitura.timestamp_recebimento.desc()).first()
+                    if ultima_leitura:
+                        timestamp_str = ultima_leitura.timestamp_sensor.strftime("%Y-%m-%d %H:%M:%S") if ultima_leitura.timestamp_sensor else ultima_leitura.timestamp_recebimento.strftime("%Y-%m-%d %H:%M:%S")
+                        self.produtos_dados[produto.produto_id] = {
+                            'produto': produto.nome,
+                            'peso_minimo': produto.peso_minimo,
+                            'peso_maximo': produto.peso_maximo,
+                            'peso_ideal': produto.peso_ideal,
+                            'peso_atual': ultima_leitura.peso_kg,
+                            'ultima_atualizacao': timestamp_str
+                        }
+                    else:
+                        # Se não houver leitura, inicializa com peso máximo
+                        self.produtos_dados[produto.produto_id] = {
+                            'produto': produto.nome,
+                            'peso_minimo': produto.peso_minimo,
+                            'peso_maximo': produto.peso_maximo,
+                            'peso_ideal': produto.peso_ideal,
+                            'peso_atual': produto.peso_maximo,
+                            'ultima_atualizacao': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        }
+                        print(f"[DB]   - Produto {produto.nome} sem leituras anteriores, usando peso máximo: {produto.peso_maximo}kg")
+        except Exception as e:
+            print(f"[ERRO] ❌ Falha ao carregar produtos do banco: {e}")
+            import traceback
+            traceback.print_exc()
     
     def inicializar_csv(self):
         """Cria o arquivo CSV com cabeçalho se não existir"""
@@ -186,93 +235,149 @@ class ServidorBackend:
     def processar_medicao(self, dados):
         """Processa uma leitura de peso"""
         produto_id = dados.get('produto_id')
+        peso_gramas = dados.get('peso_gramas', 0)
+        timestamp_str = dados.get('timestamp', '')
         
-        with self.lock:
-            self.leituras_recebidas += 1
+        try:
+            # Converte timestamp string para datetime
+            timestamp_dt = None
+            if timestamp_str:
+                try:
+                    timestamp_dt = datetime.strptime(timestamp_str, "%Y-%m-%d %H:%M:%S")
+                except:
+                    timestamp_dt = datetime.utcnow()
+            else:
+                timestamp_dt = datetime.utcnow()
             
-            # Verifica se produto existe nos cadastrados
-            if produto_id not in self.produtos_cadastrados:
-                print(f"[AVISO] Produto ID {produto_id} não cadastrado. Ignorando leitura.")
-                return
+            with self.app.app_context():
+                # Busca produto no banco
+                produto = Produto.query.get(produto_id)
+                if not produto:
+                    print(f"[AVISO] Produto ID {produto_id} não cadastrado. Ignorando leitura.")
+                    return
+                
+                # Converte gramas para KG
+                peso_atual_kg = peso_gramas / 1000
+                
+                # Calcula estado
+                estado = self._calcular_estado(peso_atual_kg, produto.peso_minimo, produto.peso_ideal)
+                
+                # Salva leitura no banco
+                leitura = Leitura(
+                    produto_id=produto_id,
+                    peso_gramas=peso_gramas,
+                    peso_kg=peso_atual_kg,
+                    peso_inicial=dados.get('peso_inicial'),
+                    percentual_restante=dados.get('percentual_restante'),
+                    timestamp_sensor=timestamp_dt
+                )
+                db.session.add(leitura)
+                db.session.commit()
+                
+                # Prepara dados para WebSocket
+                dados_produto = {
+                    'produto': produto.nome,
+                    'peso_minimo': produto.peso_minimo,
+                    'peso_maximo': produto.peso_maximo,
+                    'peso_atual': round(peso_atual_kg, 2),
+                    'peso_ideal': produto.peso_ideal,
+                    'ultima_atualizacao': timestamp_str
+                }
+                
+                # Atualiza cache em memória
+                with self.lock:
+                    self.produtos_dados[produto_id] = dados_produto
             
-            produto_cadastrado = self.produtos_cadastrados[produto_id]
-            produto_nome = produto_cadastrado['nome']
-            peso_gramas = dados.get('peso_gramas', 0)
-            timestamp = dados.get('timestamp', '')
+            # Envia via WebSocket **fora do lock para evitar deadlock
+            self._enviar_via_websocket('produto_atualizado', dados_produto)
             
-            # Converte gramas para KG
-            peso_atual_kg = peso_gramas / 1000
-            peso_minimo_kg = produto_cadastrado['pesoMinimo']
-            peso_maximo_kg = produto_cadastrado['pesoMaximo']
-            peso_ideal_kg = produto_cadastrado.get('pesoIdeal', peso_minimo_kg * 2)
-            
-            # Calcula estado
-            estado = self._calcular_estado(peso_atual_kg, peso_minimo_kg, peso_ideal_kg)
-            
-            # Prepara dados para WebSocket
-            dados_produto = {
-                'produto': produto_nome,
-                'peso_minimo': peso_minimo_kg,
-                'peso_maximo': peso_maximo_kg,
-                'peso_atual': round(peso_atual_kg, 2),
-                'peso_ideal': round(peso_ideal_kg, 2),
-                'ultima_atualizacao': timestamp
-            }
-            
-            # Armazena dados do produto
-            self.produtos_dados[produto_id] = dados_produto
-        
-        # Envia via WebSocket **fora do lock para evitar deadlock
-        self._enviar_via_websocket('produto_atualizado', dados_produto)
-        
-        # Exibe no console
-        print(f"\n[📊 LEITURA #{self.leituras_recebidas}]")
-        print(f"   {produto_nome}: {peso_atual_kg:.2f}kg - Estado: {estado}")
+            # Exibe no console
+            print(f"\n[📊 LEITURA] {produto.nome}: {peso_atual_kg:.2f}kg - Estado: {estado}")
 
-        self.salvar_csv(dados, tipo='peso')
+            self.salvar_csv(dados, tipo='peso')
+            
+        except SQLAlchemyError as e:
+            print(f"[ERRO DB] Falha ao salvar leitura: {e}")
+            db.session.rollback()
+        except Exception as e:
+            print(f"[ERRO] Erro ao processar medição: {e}")
+            import traceback
+            traceback.print_exc()
     
     def processar_alerta(self, dados):
         """Processa um alerta de reposição"""
-        with self.lock:
-            self.alertas_recebidos += 1
-            produto_id = dados.get('produto_id')
-            
-            if produto_id not in self.produtos_cadastrados:
-                return
-            
-            produto_cadastrado = self.produtos_cadastrados[produto_id]
-            produto_nome = produto_cadastrado['nome']
-            peso_atual = dados.get('peso_atual', 0)
-            peso_critico = dados.get('peso_critico', 0)
-            mensagem = dados.get('mensagem', 'Alerta de reposição')
-            timestamp = dados.get('timestamp', '')
-            
-            alerta = {
-                'produto_id': produto_id,
-                'produto_nome': produto_nome,
-                'peso_atual': round(peso_atual / 1000, 2),
-                'peso_critico': round(peso_critico / 1000, 2),
-                'peso_ideal': round(peso_critico / 1000, 2),
-                'tipo': dados.get('tipo', 'REPOSICAO_URGENTE'),
-                'mensagem': mensagem,
-                'timestamp': timestamp
-            }
-            
+        produto_id = dados.get('produto_id')
+        peso_atual_gramas = dados.get('peso_atual', 0)
+        peso_critico_gramas = dados.get('peso_critico', 0)
+        mensagem = dados.get('mensagem', 'Alerta de reposição')
+        timestamp_str = dados.get('timestamp', '')
         
-        # Envia alerta via WebSocket (fora do lock)
-        self._enviar_via_websocket('alerta', alerta)
-        
-        # Exibe alerta destacado
-        print(f"\n{'=' * 70}")
-        print(f"⚠️  [ALERTA #{self.alertas_recebidos}] ⚠️")
-        print(f"{'=' * 70}")
-        print(f"   {mensagem}")
-        print(f"   Produto: {produto_nome}")
-        print(f"   Peso atual: {alerta['peso_atual']:.2f}kg")
-        print(f"   Timestamp: {timestamp}")
-        print(f"{'=' * 70}\n")
+        try:
+            # Converte timestamp string para datetime
+            timestamp_dt = None
+            if timestamp_str:
+                try:
+                    timestamp_dt = datetime.strptime(timestamp_str, "%Y-%m-%d %H:%M:%S")
+                except:
+                    timestamp_dt = datetime.utcnow()
+            else:
+                timestamp_dt = datetime.utcnow()
+            
+            with self.app.app_context():
+                # Busca produto no banco
+                produto = Produto.query.get(produto_id)
+                if not produto:
+                    print(f"[AVISO] Produto ID {produto_id} não cadastrado. Ignorando alerta.")
+                    return
+                
+                peso_atual_kg = peso_atual_gramas / 1000
+                peso_critico_kg = peso_critico_gramas / 1000
+                
+                # Salva alerta no banco
+                alerta_db = Alerta(
+                    produto_id=produto_id,
+                    tipo=dados.get('tipo', 'REPOSICAO_URGENTE'),
+                    mensagem=mensagem,
+                    peso_atual_kg=peso_atual_kg,
+                    peso_critico_kg=peso_critico_kg,
+                    timestamp_sensor=timestamp_dt
+                )
+                db.session.add(alerta_db)
+                db.session.commit()
+                
+                alerta = {
+                    'produto_id': produto_id,
+                    'produto_nome': produto.nome,
+                    'peso_atual': round(peso_atual_kg, 2),
+                    'peso_critico': round(peso_critico_kg, 2),
+                    'peso_ideal': round(peso_critico_kg, 2),
+                    'tipo': dados.get('tipo', 'REPOSICAO_URGENTE'),
+                    'mensagem': mensagem,
+                    'timestamp': timestamp_str
+                }
+            
+            # Envia alerta via WebSocket
+            self._enviar_via_websocket('alerta', alerta)
+            
+            # Exibe alerta destacado
+            print(f"\n{'=' * 70}")
+            print(f"⚠️  [ALERTA] ⚠️")
+            print(f"{'=' * 70}")
+            print(f"   {mensagem}")
+            print(f"   Produto: {produto.nome}")
+            print(f"   Peso atual: {alerta['peso_atual']:.2f}kg")
+            print(f"   Timestamp: {timestamp_str}")
+            print(f"{'=' * 70}\n")
 
-        self.salvar_csv(dados, tipo='alerta')
+            self.salvar_csv(dados, tipo='alerta')
+            
+        except SQLAlchemyError as e:
+            print(f"[ERRO DB] Falha ao salvar alerta: {e}")
+            db.session.rollback()
+        except Exception as e:
+            print(f"[ERRO] Erro ao processar alerta: {e}")
+            import traceback
+            traceback.print_exc()
     
     def _conectar_publisher(self):
         """Conecta o cliente MQTT publisher para simulações manuais"""
@@ -319,49 +424,62 @@ class ServidorBackend:
     
     def _publicar_simulacao(self, produto_id, peso_novo_kg):
         """Publica uma mensagem MQTT simulando uma leitura de sensor"""
-        if produto_id not in self.produtos_cadastrados:
-            return False
-        
-        produto = self.produtos_cadastrados[produto_id]
-        topic = produto['topic']
-        peso_gramas = peso_novo_kg * 1000
-        peso_inicial = produto['pesoMaximo'] * 1000
-        percentual_restante = (peso_gramas / peso_inicial) * 100 if peso_inicial > 0 else 0
-        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-        
-        dados = {
-            "produto_id": produto_id,
-            "produto_nome": produto['nome'],
-            "peso_gramas": round(peso_gramas, 2),
-            "peso_inicial": peso_inicial,
-            "percentual_restante": round(percentual_restante, 2),
-            "timestamp": timestamp
-        }
-        
-        mensagem = json.dumps(dados, ensure_ascii=False)
         try:
-            result = self.client_publisher.publish(topic, mensagem, qos=1)
-            if result.rc == mqtt.MQTT_ERR_SUCCESS:
-                print(f"[SIMULAÇÃO] Publicada leitura para {produto['nome']}: {peso_novo_kg:.2f}kg")
-                return True
-            else:
-                print(f"[ERRO] Falha ao publicar simulação. Código: {result.rc}")
-                return False
+            with self.app.app_context():
+                produto = Produto.query.get(produto_id)
+                if not produto:
+                    return False
+                
+                topic = produto.topic
+                peso_gramas = peso_novo_kg * 1000
+                peso_inicial = produto.peso_maximo * 1000
+                percentual_restante = (peso_gramas / peso_inicial) * 100 if peso_inicial > 0 else 0
+                timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+                
+                dados = {
+                    "produto_id": produto_id,
+                    "produto_nome": produto.nome,
+                    "peso_gramas": round(peso_gramas, 2),
+                    "peso_inicial": peso_inicial,
+                    "percentual_restante": round(percentual_restante, 2),
+                    "timestamp": timestamp
+                }
+                
+                mensagem = json.dumps(dados, ensure_ascii=False)
+                try:
+                    result = self.client_publisher.publish(topic, mensagem, qos=1)
+                    if result.rc == mqtt.MQTT_ERR_SUCCESS:
+                        print(f"[SIMULAÇÃO] Publicada leitura para {produto.nome}: {peso_novo_kg:.2f}kg")
+                        return True
+                    else:
+                        print(f"[ERRO] Falha ao publicar simulação. Código: {result.rc}")
+                        return False
+                except Exception as e:
+                    print(f"[ERRO] Erro ao publicar simulação: {e}")
+                    return False
         except Exception as e:
-            print(f"[ERRO] Erro ao publicar simulação: {e}")
+            print(f"[ERRO] Erro ao buscar produto para simulação: {e}")
             return False
     
     def conectar(self):
         """Conecta ao broker MQTT"""
         try:
+            print(f"[MQTT] Tentando conectar ao broker {self.broker_host}:{self.broker_port}...")
             self.client.connect(self.broker_host, self.broker_port, 60)
             self.client.loop_start()
-            # Conecta também o publisher
+            
+            # Aguarda um pouco para verificar se conectou
+            time.sleep(1)
+            
+            # Tenta conectar também o publisher (não crítico)
             self._conectar_publisher()
+            
+            print(f"[MQTT] ✅ Conectado ao broker {self.broker_host}:{self.broker_port}")
             return True
         except Exception as e:
             print(f"[ERRO] Não foi possível conectar ao broker: {e}")
             print(f"[INFO] Certifique-se de que um broker MQTT está rodando em {self.broker_host}:{self.broker_port}")
+            print(f"[INFO] Ou configure BROKER_HOST no docker-compose.yml para um broker acessível")
             return False
     
     def _configurar_rotas(self):
@@ -397,63 +515,99 @@ class ServidorBackend:
                 if peso_ideal < peso_minimo or peso_ideal > peso_maximo:
                     return jsonify({'erro': 'pesoIdeal deve estar entre pesoMinimo e pesoMaximo'}), 400
                 
-                with self.lock:
-                    # Validação: verifica se já existe produto com o mesmo nome
-                    for produto_existente in self.produtos_cadastrados.values():
-                        if produto_existente['nome'].lower() == nome.lower():
+                with self.app.app_context():
+                    try:
+                        # Validação: verifica se já existe produto com o mesmo nome
+                        if Produto.query.filter(Produto.nome.ilike(nome)).first():
                             return jsonify({'erro': f'Já existe um produto com o nome "{nome}"'}), 409
-                    
-                    # Determina o tópico (gera automaticamente se não informado)
-                    topic_final = topic if topic else f"{TOPIC_BASE}/produto{self.next_produto_id}/peso"
-                    
-                    # Validação: verifica se já existe produto com o mesmo tópico
-                    for produto_existente in self.produtos_cadastrados.values():
-                        if produto_existente['topic'] == topic_final:
+                        
+                        # Determina o tópico (gera automaticamente se não informado)
+                        if not topic:
+                            # Busca o maior ID para gerar próximo
+                            ultimo_produto = Produto.query.order_by(Produto.produto_id.desc()).first()
+                            proximo_id = (ultimo_produto.produto_id + 1) if ultimo_produto else 1
+                            topic_final = f"{TOPIC_BASE}/produto{proximo_id}/peso"
+                        else:
+                            topic_final = topic
+                        
+                        # Validação: verifica se já existe produto com o mesmo tópico
+                        if Produto.query.filter_by(topic=topic_final).first():
                             return jsonify({'erro': f'Já existe um produto usando o tópico "{topic_final}"'}), 409
-                    
-                    produto_id = self.next_produto_id
-                    self.next_produto_id += 1
-                    
-                    produto = {
-                        'produto_id': produto_id,
-                        'nome': nome,
-                        'pesoMinimo': peso_minimo,
-                        'pesoMaximo': peso_maximo,
-                        'pesoIdeal': peso_ideal,
-                        'topic': topic_final
-                    }
-                    
-                    self.produtos_cadastrados[produto_id] = produto
-                    
-                    print(f"[INFO] Produto cadastrado: ID {produto_id} - {nome} (tópico: {topic_final})")
-                
-                return jsonify(produto), 201
+                        
+                        # Cria produto no banco
+                        produto = Produto(
+                            nome=nome,
+                            peso_minimo=peso_minimo,
+                            peso_maximo=peso_maximo,
+                            peso_ideal=peso_ideal,
+                            topic=topic_final
+                        )
+                        db.session.add(produto)
+                        db.session.commit()
+                        
+                        # Recarrega o produto para garantir que o ID foi gerado
+                        db.session.refresh(produto)
+                        
+                        print(f"[INFO] ✅ Produto cadastrado: ID {produto.produto_id} - {nome} (tópico: {topic_final})")
+                        
+                        return jsonify(produto.to_dict()), 201
+                        
+                    except SQLAlchemyError as e:
+                        db.session.rollback()
+                        print(f"[ERRO DB] Falha ao cadastrar produto: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        return jsonify({'erro': f'Erro no banco de dados: {str(e)}'}), 500
+                    except Exception as e:
+                        db.session.rollback()
+                        print(f"[ERRO] Erro ao cadastrar produto: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        return jsonify({'erro': f'Erro ao cadastrar produto: {str(e)}'}), 500
                 
             except ValueError as e:
                 return jsonify({'erro': f'Valor inválido: {str(e)}'}), 400
             except Exception as e:
+                print(f"[ERRO] Erro geral ao cadastrar produto: {e}")
+                import traceback
+                traceback.print_exc()
                 return jsonify({'erro': f'Erro ao cadastrar produto: {str(e)}'}), 500
         
         @self.app.route('/api/produtos', methods=['GET'])
         def listar_produtos_cadastrados():
             """Lista todos os produtos cadastrados"""
-            with self.lock:
-                produtos = list(self.produtos_cadastrados.values())
-                return jsonify(produtos)
+            try:
+                with self.app.app_context():
+                    produtos = Produto.query.all()
+                    return jsonify([p.to_dict() for p in produtos])
+            except Exception as e:
+                return jsonify({'erro': f'Erro ao listar produtos: {str(e)}'}), 500
         
         @self.app.route('/api/produtos/<int:produto_id>', methods=['DELETE'])
         def remover_produto(produto_id):
             """Remove um produto cadastrado"""
-            with self.lock:
-                if produto_id not in self.produtos_cadastrados:
-                    return jsonify({'erro': 'Produto não encontrado'}), 404
-                
-                produto = self.produtos_cadastrados.pop(produto_id)
-                if produto_id in self.produtos_dados:
-                    del self.produtos_dados[produto_id]
-                
-                print(f"[INFO] Produto removido: ID {produto_id} - {produto['nome']}")
-                return jsonify({'mensagem': 'Produto removido com sucesso'}), 200
+            try:
+                with self.app.app_context():
+                    produto = Produto.query.get(produto_id)
+                    if not produto:
+                        return jsonify({'erro': 'Produto não encontrado'}), 404
+                    
+                    nome_produto = produto.nome
+                    db.session.delete(produto)
+                    db.session.commit()
+                    
+                    # Remove do cache em memória
+                    with self.lock:
+                        if produto_id in self.produtos_dados:
+                            del self.produtos_dados[produto_id]
+                    
+                    print(f"[INFO] Produto removido: ID {produto_id} - {nome_produto}")
+                    return jsonify({'mensagem': 'Produto removido com sucesso'}), 200
+            except SQLAlchemyError as e:
+                db.session.rollback()
+                return jsonify({'erro': f'Erro no banco de dados: {str(e)}'}), 500
+            except Exception as e:
+                return jsonify({'erro': f'Erro ao remover produto: {str(e)}'}), 500
         
         @self.app.route('/api/produtos/<int:produto_id>/retirada', methods=['POST'])
         def simular_retirada(produto_id):
@@ -462,17 +616,16 @@ class ServidorBackend:
                 data = request.get_json() or {}
                 quantidade_kg = float(data.get('quantidade', 0))  # Quantidade em KG
                 
-                with self.lock:
-                    if produto_id not in self.produtos_cadastrados:
+                with self.app.app_context():
+                    produto = Produto.query.get(produto_id)
+                    if not produto:
                         return jsonify({'erro': 'Produto não encontrado'}), 404
                     
-                    produto = self.produtos_cadastrados[produto_id]
-                    
-                    # Obtém peso atual do produto (se existir)
+                    # Obtém peso atual do produto (cache ou máximo)
                     if produto_id in self.produtos_dados:
-                        peso_atual_kg = self.produtos_dados[produto_id].get('peso_atual', produto['pesoMaximo'])
+                        peso_atual_kg = self.produtos_dados[produto_id].get('peso_atual', produto.peso_maximo)
                     else:
-                        peso_atual_kg = produto['pesoMaximo']
+                        peso_atual_kg = produto.peso_maximo
                     
                     # Se quantidade não foi especificada, usa valor aleatório (5-15% do peso atual)
                     if quantidade_kg <= 0:
@@ -486,16 +639,12 @@ class ServidorBackend:
                 
                 # 2. Atualiza dados localmente e envia via WebSocket imediatamente
                 timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-                peso_minimo_kg = produto['pesoMinimo']
-                peso_maximo_kg = produto['pesoMaximo']
-                peso_ideal_kg = produto.get('pesoIdeal', peso_minimo_kg * 2)
-                
                 dados_produto = {
-                    'produto': produto['nome'],
-                    'peso_minimo': peso_minimo_kg,
-                    'peso_maximo': peso_maximo_kg,
+                    'produto': produto.nome,
+                    'peso_minimo': produto.peso_minimo,
+                    'peso_maximo': produto.peso_maximo,
                     'peso_atual': round(peso_novo_kg, 2),
-                    'peso_ideal': round(peso_ideal_kg, 2),
+                    'peso_ideal': produto.peso_ideal,
                     'ultima_atualizacao': timestamp
                 }
                 
@@ -512,7 +661,7 @@ class ServidorBackend:
                     return jsonify({
                         'mensagem': 'Retirada executada com sucesso',
                         'produto_id': produto_id,
-                        'produto_nome': produto['nome'],
+                        'produto_nome': produto.nome,
                         'peso_anterior': round(peso_atual_kg, 2),
                         'quantidade_retirada': round(quantidade_kg, 2),
                         'peso_novo': round(peso_novo_kg, 2),
@@ -534,12 +683,11 @@ class ServidorBackend:
                 data = request.get_json() or {}
                 quantidade_kg = float(data.get('quantidade', 0))  # Quantidade em KG
                 
-                with self.lock:
-                    if produto_id not in self.produtos_cadastrados:
+                with self.app.app_context():
+                    produto = Produto.query.get(produto_id)
+                    if not produto:
                         return jsonify({'erro': 'Produto não encontrado'}), 404
                     
-                    produto = self.produtos_cadastrados[produto_id]
-
                     if produto_id in self.produtos_dados:
                         peso_atual_kg = self.produtos_dados[produto_id].get('peso_atual', 0)
                     else:
@@ -550,23 +698,19 @@ class ServidorBackend:
                         quantidade_kg = random.uniform(1, 5)
                     
                     # Calcula novo peso sem ultrapassar o máximo
-                    peso_novo_kg = min(produto['pesoMaximo'], peso_atual_kg + quantidade_kg)
+                    peso_novo_kg = min(produto.peso_maximo, peso_atual_kg + quantidade_kg)
 
                 # 1. Atualiza o sensor no publicador (reflete na balança real)
                 sensor_atualizado = self._atualizar_sensor_publicador(produto_id, quantidade_kg, 'reposicao')
                 
                 # 2. Atualiza dados localmente e envia via WebSocket imediatamente
                 timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-                peso_minimo_kg = produto['pesoMinimo']
-                peso_maximo_kg = produto['pesoMaximo']
-                peso_ideal_kg = produto.get('pesoIdeal', peso_minimo_kg * 2)
-                
                 dados_produto = {
-                    'produto': produto['nome'],
-                    'peso_minimo': peso_minimo_kg,
-                    'peso_maximo': peso_maximo_kg,
+                    'produto': produto.nome,
+                    'peso_minimo': produto.peso_minimo,
+                    'peso_maximo': produto.peso_maximo,
                     'peso_atual': round(peso_novo_kg, 2),
-                    'peso_ideal': round(peso_ideal_kg, 2),
+                    'peso_ideal': produto.peso_ideal,
                     'ultima_atualizacao': timestamp
                 }
                 
@@ -583,7 +727,7 @@ class ServidorBackend:
                     return jsonify({
                         'mensagem': 'Reposição executada com sucesso',
                         'produto_id': produto_id,
-                        'produto_nome': produto['nome'],
+                        'produto_nome': produto.nome,
                         'peso_anterior': round(peso_atual_kg, 2),
                         'quantidade_adicionada': round(quantidade_kg, 2),
                         'peso_novo': round(peso_novo_kg, 2),
@@ -668,24 +812,51 @@ class ServidorBackend:
         self._iniciar_api()
         time.sleep(2)  # Aguarda servidor iniciar
         
-        if self.conectar():
+        # Tenta conectar ao MQTT (mas continua mesmo se falhar)
+        mqtt_conectado = self.conectar()
+        if not mqtt_conectado:
+            print("[AVISO] ⚠️ Não foi possível conectar ao broker MQTT.")
+            print("[AVISO] A API REST e WebSocket continuarão funcionando normalmente.")
+            print("[AVISO] Para receber dados MQTT, certifique-se de que o broker está acessível.")
+        
+        try:
+            print("\n[INFO] ✅ Backend ativo. API REST e WebSocket disponíveis.")
+            if mqtt_conectado:
+                print("[INFO] ✅ Conexão MQTT estabelecida.")
+            else:
+                print("[INFO] ⚠️ MQTT não conectado - apenas API REST e WebSocket disponíveis.")
+            print("[INFO] Pressione Ctrl+C para parar.\n")
+            
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            print("\n\n[INFO] Encerrando servidor...")
             try:
-                print("\n[INFO] Backend ativo. Pressione Ctrl+C para parar.\n")
-                while True:
-                    time.sleep(1)
-            except KeyboardInterrupt:
-                print("\n\n[INFO] Encerrando servidor...")
-                print(f"[ESTATÍSTICAS] Leituras recebidas: {self.leituras_recebidas}")
-                print(f"[ESTATÍSTICAS] Alertas recebidos: {self.alertas_recebidos}")
-                print(f"[INFO] Dados salvos em: {self.arquivo_csv}")
-                self.client.loop_stop()
-                self.client.disconnect()
+                with self.app.app_context():
+                    num_leituras = Leitura.query.count()
+                    num_alertas = Alerta.query.count()
+                    print(f"[ESTATÍSTICAS] Total de leituras no banco: {num_leituras}")
+                    print(f"[ESTATÍSTICAS] Total de alertas no banco: {num_alertas}")
+            except:
+                pass
+            print(f"[INFO] Dados salvos em: {self.arquivo_csv}")
+            
+            # Desconecta MQTT apenas se estava conectado
+            try:
+                if mqtt_conectado:
+                    self.client.loop_stop()
+                    self.client.disconnect()
+            except:
+                pass
+            
+            try:
                 if self.client_publisher_connected:
                     self.client_publisher.loop_stop()
                     self.client_publisher.disconnect()
-                print("[INFO] Servidor encerrado.")
-        else:
-            print("[ERRO] Não foi possível iniciar o servidor.")
+            except:
+                pass
+            
+            print("[INFO] Servidor encerrado.")
 
 
 def main():
@@ -724,6 +895,11 @@ def main():
         default=PUBLICADOR_API_URL,
         help=f"URL da API do publicador (padrão: {PUBLICADOR_API_URL})"
     )
+    parser.add_argument(
+        "--database-url",
+        default=DATABASE_URL,
+        help=f"URL do banco de dados (padrão: {DATABASE_URL.split('@')[-1] if '@' in DATABASE_URL else DATABASE_URL})"
+    )
     
     args = parser.parse_args()
     
@@ -733,7 +909,8 @@ def main():
         arquivo_csv=args.csv,
         api_host=args.api_host,
         api_port=args.api_port,
-        publicador_api_url=args.publicador_api_url
+        publicador_api_url=args.publicador_api_url,
+        database_url=args.database_url
     )
     
     servidor.executar()

@@ -1,0 +1,30 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Instala dependências do sistema
+RUN apt-get update && apt-get install -y \
+    gcc \
+    postgresql-client \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copia requirements
+COPY requirements.txt .
+
+# Instala dependências Python
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copia código fonte
+COPY src/ ./src/
+
+# Variáveis de ambiente padrão
+ENV PYTHONUNBUFFERED=1
+ENV FLASK_APP=src/servidor_assinante.py
+
+# Expõe porta
+EXPOSE 5000
+
+# Comando para rodar
+CMD ["python", "src/servidor_assinante.py"]
+
