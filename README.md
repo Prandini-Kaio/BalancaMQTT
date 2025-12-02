@@ -10,8 +10,9 @@ Sistema completo de monitoramento de estoque usando sensores de peso que se comu
 - ✅ Alertas de reposição em tempo real
 - ✅ **Persistência de dados em banco de dados PostgreSQL**
 - ✅ Armazenamento de backup em arquivo CSV
+- ✅ Autenticação JWT para proteção dos endpoints**
 - ✅ API REST para acesso aos dados pelo frontend
-- ✅ WebSocket para atualizações em tempo real
+- ✅ WebSocket para atualizações em tempo real (autenticação obrigatória)
 - ✅ Métricas gerais do sistema (total de produtos, estados, etc.)
 - ✅ Estados de estoque: CRÍTICO, BAIXO, IDEAL
 - ✅ **Dockerização completa do sistema**
@@ -23,8 +24,10 @@ Sistema completo de monitoramento de estoque usando sensores de peso que se comu
 - **Flask** - Framework web para API REST
 - **Flask-SocketIO** - WebSocket para comunicação em tempo real
 - **Flask-CORS** - CORS para API
+- **Flask-JWT-Extended** - Autenticação JWT
 - **SQLAlchemy** - ORM para banco de dados
 - **PostgreSQL** - Banco de dados relacional
+- **Werkzeug** - Hash de senhas (bcrypt)
 - **Docker & Docker Compose** - Containerização
 - **CSV** - Backup de dados
 - **JSON** - Formato de mensagens
@@ -157,6 +160,8 @@ O servidor irá:
 - Salvar dados no banco de dados e arquivo `dados.csv` (backup)
 - Iniciar API REST em `http://localhost:5000`
 - Iniciar WebSocket em `ws://localhost:5000`
+
+**Antes de usar:** Crie um usuário administrador com `python create_admin.py`
 
 #### 2. Iniciar os Sensores (Publicador)
 

@@ -22,3 +22,7 @@ PUBLICADOR_API_URL = os.getenv('PUBLICADOR_API_URL', 'http://publicador:5001')
 # CSV (backup)
 ARQUIVO_CSV = os.getenv('ARQUIVO_CSV', 'dados.csv')
 
+# JWT
+JWT_SECRET_KEY = os.getenv('JWT_SECRET_KEY', 'sua-chave-secreta-mude-em-producao-12345')
+JWT_ACCESS_TOKEN_EXPIRES = int(os.getenv('JWT_ACCESS_TOKEN_EXPIRES', '86400'))  # 24 horas em segundos
+

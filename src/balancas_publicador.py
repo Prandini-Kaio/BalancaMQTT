@@ -206,7 +206,8 @@ class PublicadorBalancas:
     def obter_produtos_cadastrados(self):
         """Obtém produtos cadastrados via API"""
         try:
-            response = requests.get(f"{self.api_url}/api/produtos", timeout=5)
+            # Usa endpoint público para o publicador
+            response = requests.get(f"{self.api_url}/api/produtos/public", timeout=5)
             if response.status_code == 200:
                 produtos = response.json()
                 print(f"[INFO] {len(produtos)} produto(s) encontrado(s) via API")

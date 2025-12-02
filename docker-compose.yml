@@ -33,6 +33,8 @@ services:
       API_PORT: 5000
       PUBLICADOR_API_URL: http://publicador:5001
       TOPIC_BASE: estoque
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:-sua-chave-secreta-mude-em-producao-12345}
+      JWT_ACCESS_TOKEN_EXPIRES: ${JWT_ACCESS_TOKEN_EXPIRES:-86400}
     ports:
       - "5000:5000"
     depends_on:

@@ -11,13 +11,18 @@ from threading import Thread, Lock
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from flask_socketio import SocketIO, emit
+from flask_jwt_extended import (
+    JWTManager, jwt_required, create_access_token,
+    get_jwt_identity, get_jwt
+)
 from sqlalchemy.exc import SQLAlchemyError
 
 # Imports locais
-from models import db, Produto, Leitura, Alerta, init_db
+from models import db, Produto, Leitura, Alerta, User, init_db
 from config import (
     DATABASE_URL, BROKER_HOST, BROKER_PORT, TOPIC_BASE,
-    API_HOST, API_PORT, PUBLICADOR_API_URL, ARQUIVO_CSV
+    API_HOST, API_PORT, PUBLICADOR_API_URL, ARQUIVO_CSV,
+    JWT_SECRET_KEY, JWT_ACCESS_TOKEN_EXPIRES
 )
 
 TOPIC_SUBSCRIBE = f"{TOPIC_BASE}/#"
@@ -61,6 +66,11 @@ class ServidorBackend:
         self.app.config['SQLALCHEMY_DATABASE_URI'] = database_url
         self.app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
         db.init_app(self.app)
+        
+        # Configuração JWT
+        self.app.config['JWT_SECRET_KEY'] = JWT_SECRET_KEY
+        self.app.config['JWT_ACCESS_TOKEN_EXPIRES'] = JWT_ACCESS_TOKEN_EXPIRES
+        self.jwt = JWTManager(self.app)
         
         # Inicializa banco de dados (com retry para aguardar PostgreSQL estar pronto)
         try:
@@ -489,7 +499,152 @@ class ServidorBackend:
         def ping():
             return jsonify({'status': 'ok', 'message': 'pong'})
         
+        # ========== ENDPOINTS DE AUTENTICAÇÃO ========== OH YEAH
+        
+        @self.app.route('/api/auth/register', methods=['POST'])
+        def registrar_usuario():
+            """Registra um novo usuário"""
+            try:
+                data = request.get_json()
+                
+                if not data:
+                    return jsonify({'erro': 'Dados não fornecidos'}), 400
+                
+                username = data.get('username')
+                email = data.get('email')
+                password = data.get('password')
+                admin = data.get('admin', False)
+                
+                # Validação
+                if not username or not email or not password:
+                    return jsonify({'erro': 'Campos obrigatórios: username, email, password'}), 400
+                
+                if len(password) < 6:
+                    return jsonify({'erro': 'Senha deve ter pelo menos 6 caracteres'}), 400
+                
+                with self.app.app_context():
+                    # Verifica se usuário já existe
+                    if User.query.filter_by(username=username).first():
+                        return jsonify({'erro': f'Usuário "{username}" já existe'}), 409
+                    
+                    if User.query.filter_by(email=email).first():
+                        return jsonify({'erro': f'Email "{email}" já está cadastrado'}), 409
+                    
+                    # Cria novo usuário
+                    novo_usuario = User(
+                        username=username,
+                        email=email,
+                        admin=admin
+                    )
+                    novo_usuario.set_password(password)
+                    
+                    db.session.add(novo_usuario)
+                    db.session.commit()
+                    
+                    print(f"[AUTH] Novo usuário registrado: {username} (admin: {admin})")
+                    
+                    return jsonify({
+                        'mensagem': 'Usuário registrado com sucesso',
+                        'usuario': novo_usuario.to_dict()
+                    }), 201
+                    
+            except SQLAlchemyError as e:
+                db.session.rollback()
+                print(f"[ERRO DB] Falha ao registrar usuário: {e}")
+                return jsonify({'erro': f'Erro no banco de dados: {str(e)}'}), 500
+            except Exception as e:
+                print(f"[ERRO] Erro ao registrar usuário: {e}")
+                import traceback
+                traceback.print_exc()
+                return jsonify({'erro': f'Erro ao registrar usuário: {str(e)}'}), 500
+        
+        @self.app.route('/api/auth/login', methods=['POST'])
+        def login():
+            """Autentica um usuário e retorna token JWT"""
+            try:
+                data = request.get_json()
+                
+                if not data:
+                    return jsonify({'erro': 'Credenciais não fornecidas'}), 400
+                
+                username = data.get('username')
+                password = data.get('password')
+                
+                if not username or not password:
+                    return jsonify({'erro': 'Campos obrigatórios: username, password'}), 400
+                
+                with self.app.app_context():
+                    # Busca usuário
+                    usuario = User.query.filter_by(username=username).first()
+                    
+                    if not usuario or not usuario.check_password(password):
+                        return jsonify({'erro': 'Credenciais inválidas'}), 401
+                    
+                    if not usuario.ativo:
+                        return jsonify({'erro': 'Usuário inativo'}), 403
+                    
+                    # Atualiza último login
+                    usuario.ultimo_login = datetime.utcnow()
+                    db.session.commit()
+                    
+                    # Gera token JWT
+                    access_token = create_access_token(
+                        identity=usuario.usuario_id,
+                        additional_claims={
+                            'username': usuario.username,
+                            'admin': usuario.admin
+                        }
+                    )
+                    
+                    print(f"[AUTH] Login realizado: {username}")
+                    
+                    return jsonify({
+                        'access_token': access_token,
+                        'token_type': 'Bearer',
+                        'usuario': usuario.to_dict()
+                    }), 200
+                    
+            except SQLAlchemyError as e:
+                db.session.rollback()
+                return jsonify({'erro': f'Erro no banco de dados: {str(e)}'}), 500
+            except Exception as e:
+                print(f"[ERRO] Erro ao fazer login: {e}")
+                return jsonify({'erro': f'Erro ao fazer login: {str(e)}'}), 500
+        
+        @self.app.route('/api/auth/me', methods=['GET'])
+        @jwt_required()
+        def perfil_usuario():
+            """Retorna informações do usuário autenticado"""
+            try:
+                usuario_id = get_jwt_identity()
+                with self.app.app_context():
+                    usuario = User.query.get(usuario_id)
+                    if not usuario:
+                        return jsonify({'erro': 'Usuário não encontrado'}), 404
+                    return jsonify(usuario.to_dict()), 200
+            except Exception as e:
+                return jsonify({'erro': f'Erro ao buscar perfil: {str(e)}'}), 500
+        
+        @self.app.route('/api/auth/users', methods=['GET'])
+        @jwt_required()
+        def listar_usuarios():
+            """Lista todos os usuários (apenas administradores)"""
+            try:
+                usuario_id = get_jwt_identity()
+                with self.app.app_context():
+                    usuario = User.query.get(usuario_id)
+                    if not usuario or not usuario.admin:
+                        return jsonify({'erro': 'Acesso negado. Apenas administradores.'}), 403
+                    
+                    usuarios = User.query.all()
+                    return jsonify([u.to_dict() for u in usuarios]), 200
+            except Exception as e:
+                return jsonify({'erro': f'Erro ao listar usuários: {str(e)}'}), 500
+        
+        # ========== ENDPOINTS DE PRODUTOS (PROTEGIDOS) ==========
+        
         @self.app.route('/api/produtos', methods=['POST'])
+        @jwt_required()
         def cadastrar_produto():
             """Cadastra um novo produto para simulação"""
             try:
@@ -573,7 +728,19 @@ class ServidorBackend:
                 traceback.print_exc()
                 return jsonify({'erro': f'Erro ao cadastrar produto: {str(e)}'}), 500
         
+        @self.app.route('/api/produtos/public', methods=['GET'])
+        def listar_produtos_publico():
+            """Lista produtos para uso interno (publicador) - endpoint público"""
+            try:
+                with self.app.app_context():
+                    produtos = Produto.query.all()
+                    produtos_dict = [p.to_dict() for p in produtos]
+                    return jsonify(produtos_dict)
+            except Exception as e:
+                return jsonify({'erro': f'Erro ao listar produtos: {str(e)}'}), 500
+        
         @self.app.route('/api/produtos', methods=['GET'])
+        @jwt_required()
         def listar_produtos_cadastrados():
             """Lista todos os produtos cadastrados"""
             try:
@@ -584,6 +751,7 @@ class ServidorBackend:
                 return jsonify({'erro': f'Erro ao listar produtos: {str(e)}'}), 500
         
         @self.app.route('/api/produtos/<int:produto_id>', methods=['DELETE'])
+        @jwt_required()
         def remover_produto(produto_id):
             """Remove um produto cadastrado"""
             try:
@@ -610,6 +778,7 @@ class ServidorBackend:
                 return jsonify({'erro': f'Erro ao remover produto: {str(e)}'}), 500
         
         @self.app.route('/api/produtos/<int:produto_id>/retirada', methods=['POST'])
+        @jwt_required()
         def simular_retirada(produto_id):
             """Simula retirada manual de produtos - centralizado no backend"""
             try:
@@ -677,6 +846,7 @@ class ServidorBackend:
                 return jsonify({'erro': f'Erro ao simular retirada: {str(e)}'}), 500
         
         @self.app.route('/api/produtos/<int:produto_id>/reposicao', methods=['POST'])
+        @jwt_required()
         def simular_reposicao(produto_id):
             """Simula reposição manual de produtos - centralizado no backend"""
             try:
@@ -746,26 +916,50 @@ class ServidorBackend:
         """Configura eventos do WebSocket"""
         
         @self.socketio.on('connect')
-        def handle_connect():
-            print(f"[WEBSOCKET] ✅ Cliente conectado")
+        def handle_connect(auth):
+            """Conecta cliente ao WebSocket (autenticação obrigatória)"""
+            print(f"[WEBSOCKET] Tentativa de conexão recebida")
+            
+            # Autenticação obrigatória via token no auth
+            if not auth or not isinstance(auth, dict) or 'token' not in auth:
+                print(f"[WEBSOCKET] ❌ Conexão rejeitada: Token não fornecido")
+                return False  # Rejeita a conexão
+            
             try:
-                # Obtém lista de produtos
-                with self.lock:
-                    produtos_list = list(self.produtos_dados.values())
-                    num_produtos = len(produtos_list)
+                from flask_jwt_extended import decode_token
+                decoded = decode_token(auth['token'])
+                usuario_id = decoded.get('sub')
+                
+                with self.app.app_context():
+                    usuario_autenticado = User.query.get(usuario_id)
+                    if not usuario_autenticado:
+                        print(f"[WEBSOCKET] ❌ Conexão rejeitada: Usuário não encontrado")
+                        return False
+                    
+                    if not usuario_autenticado.ativo:
+                        print(f"[WEBSOCKET] ❌ Conexão rejeitada: Usuário inativo")
+                        return False
+                    
+                    print(f"[WEBSOCKET] ✅ Cliente autenticado e conectado: {usuario_autenticado.username}")
+                    
+                    # Obtém lista de produtos
+                    with self.lock:
+                        produtos_list = list(self.produtos_dados.values())
+                        num_produtos = len(produtos_list)
 
-                if num_produtos > 0:
-                    print(f"[WEBSOCKET] 📦 Enviando {num_produtos} produto(s) iniciais")
-                    emit('produtos_iniciais', produtos_list)
-                    print(f"[WEBSOCKET] ✅ Produtos iniciais enviados")
-                else:
-                    print(f"[WEBSOCKET] ⚠️ Nenhum produto com dados ainda. Enviando lista vazia.")
-                    emit('produtos_iniciais', [])
-                    emit('teste', {'mensagem': 'WebSocket funcionando!'})
+                    if num_produtos > 0:
+                        print(f"[WEBSOCKET] 📦 Enviando {num_produtos} produto(s) iniciais")
+                        emit('produtos_iniciais', produtos_list)
+                        print(f"[WEBSOCKET] ✅ Produtos iniciais enviados")
+                    else:
+                        print(f"[WEBSOCKET] ⚠️ Nenhum produto com dados ainda. Enviando lista vazia.")
+                        emit('produtos_iniciais', [])
+                    
+                    return True  # Aceita a conexão
+                    
             except Exception as e:
-                print(f"[ERRO] ❌ Falha ao enviar produtos iniciais: {e}")
-                import traceback
-                traceback.print_exc()
+                print(f"[WEBSOCKET] ❌ Conexão rejeitada: Token inválido ou expirado - {e}")
+                return False  # Rejeita a conexão
         
         @self.socketio.on('disconnect')
         def handle_disconnect():
@@ -788,12 +982,17 @@ class ServidorBackend:
         print(f"[API] Servidor iniciado em http://{self.api_host}:{self.api_port}")
         print(f"[API] WebSocket disponível em ws://{self.api_host}:{self.api_port}")
         print(f"[API] Endpoints disponíveis:")
-        print(f"       GET  /api/ping - Status do servidor")
-        print(f"       POST /api/produtos - Cadastrar produto")
-        print(f"       GET  /api/produtos - Listar produtos cadastrados")
-        print(f"       DELETE /api/produtos/<id> - Remover produto")
-        print(f"       POST /api/produtos/<id>/retirada - Retirar peso (atualiza sensor + MQTT)")
-        print(f"       POST /api/produtos/<id>/reposicao - Repor peso (atualiza sensor + MQTT)")
+        print(f"       GET  /api/ping - Status do servidor (público)")
+        print(f"       POST /api/auth/register - Registrar usuário (público)")
+        print(f"       POST /api/auth/login - Login (público)")
+        print(f"       GET  /api/auth/me - Perfil do usuário (🔒)")
+        print(f"       GET  /api/auth/users - Listar usuários (🔒 admin)")
+        print(f"       GET  /api/produtos/public - Listar produtos (público, uso interno)")
+        print(f"       POST /api/produtos - Cadastrar produto (🔒)")
+        print(f"       GET  /api/produtos - Listar produtos (🔒)")
+        print(f"       DELETE /api/produtos/<id> - Remover produto (🔒)")
+        print(f"       POST /api/produtos/<id>/retirada - Retirar peso (🔒)")
+        print(f"       POST /api/produtos/<id>/reposicao - Repor peso (🔒)")
         print(f"[API] Publicador: {self.publicador_api_url}")
     
     def executar(self):

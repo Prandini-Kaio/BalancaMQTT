@@ -3,8 +3,46 @@ Modelos de banco de dados para o sistema de controle de estoque por peso
 """
 from datetime import datetime
 from flask_sqlalchemy import SQLAlchemy
+from werkzeug.security import generate_password_hash, check_password_hash
 
 db = SQLAlchemy()
+
+
+class User(db.Model):
+    """Modelo para usuários do sistema"""
+    __tablename__ = 'usuarios'
+    
+    usuario_id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    username = db.Column(db.String(80), unique=True, nullable=False, index=True)
+    email = db.Column(db.String(120), unique=True, nullable=False, index=True)
+    password_hash = db.Column(db.String(255), nullable=False)
+    ativo = db.Column(db.Boolean, default=True, nullable=False)
+    admin = db.Column(db.Boolean, default=False, nullable=False)
+    criado_em = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+    ultimo_login = db.Column(db.DateTime)
+    
+    def set_password(self, password):
+        """Define a senha do usuário (hash)"""
+        self.password_hash = generate_password_hash(password)
+    
+    def check_password(self, password):
+        """Verifica se a senha está correta"""
+        return check_password_hash(self.password_hash, password)
+    
+    def to_dict(self):
+        """Converte o modelo para dicionário (sem senha)"""
+        return {
+            'usuario_id': self.usuario_id,
+            'username': self.username,
+            'email': self.email,
+            'ativo': self.ativo,
+            'admin': self.admin,
+            'criado_em': self.criado_em.isoformat() if self.criado_em else None,
+            'ultimo_login': self.ultimo_login.isoformat() if self.ultimo_login else None
+        }
+    
+    def __repr__(self):
+        return f"<User {self.usuario_id}: {self.username}>"
 
 
 class Produto(db.Model):

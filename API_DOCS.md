@@ -4,6 +4,179 @@
 
 O backend expõe uma API REST para cadastro de produtos e WebSocket para comunicação em tempo real com o frontend. A API está disponível em `http://localhost:5000` por padrão.
 
+**⚠️ IMPORTANTE:** A partir desta versão, a maioria dos endpoints requer **autenticação JWT**. Apenas `/api/ping` é público.
+
+## Autenticação
+
+O sistema utiliza **JWT (JSON Web Tokens)** para autenticação. Para acessar endpoints protegidos:
+
+- Inclua o token no header `Authorization: Bearer <token>` em todas as requisições
+
+### Fluxo de Autenticação
+
+```bash
+# 1. Registrar novo usuário
+POST /api/auth/register
+
+# 2. Fazer login e obter token
+POST /api/auth/login
+
+# 3. Usar token nas requisições
+GET /api/produtos
+Authorization: Bearer <seu-token-aqui>
+```
+
+---
+
+## Endpoints de Autenticação
+
+### 1. Registrar Usuário
+**POST** `/api/auth/register`
+
+Registra um novo usuário no sistema.
+
+**Body (JSON):**
+```json
+{
+  "username": "usuario123",
+  "email": "usuario@example.com",
+  "password": "senha123",
+  "admin": false
+}
+```
+
+**Campos:**
+- `username` (obrigatório): Nome de usuário único
+- `email` (obrigatório): Email único
+- `password` (obrigatório): Senha (mínimo 6 caracteres)
+- `admin` (opcional, padrão: false): Se o usuário é administrador
+
+**Resposta (201):**
+```json
+{
+  "mensagem": "Usuário registrado com sucesso",
+  "usuario": {
+    "usuario_id": 1,
+    "username": "usuario123",
+    "email": "usuario@example.com",
+    "ativo": true,
+    "admin": false,
+    "criado_em": "2025-12-01T14:00:00",
+    "ultimo_login": null
+  }
+}
+```
+
+**Erros:**
+- `400`: Campos obrigatórios faltando ou senha muito curta
+- `409`: Usuário ou email já existem
+- `500`: Erro interno
+
+---
+
+### 2. Login
+**POST** `/api/auth/login`
+
+Autentica um usuário e retorna um token JWT.
+
+**Body (JSON):**
+```json
+{
+  "username": "usuario123",
+  "password": "senha123"
+}
+```
+
+**Resposta (200):**
+```json
+{
+  "access_token": "eyJ0eXAiOiJKV1QiLCJhbGc...",
+  "token_type": "Bearer",
+  "usuario": {
+    "usuario_id": 1,
+    "username": "usuario123",
+    "email": "usuario@example.com",
+    "ativo": true,
+    "admin": false,
+    "criado_em": "2025-12-01T14:00:00",
+    "ultimo_login": "2025-12-01T15:00:00"
+  }
+}
+```
+
+**Erros:**
+- `400`: Credenciais não fornecidas
+- `401`: Credenciais inválidas
+- `403`: Usuário inativo
+
+**Exemplo:**
+```bash
+curl -X POST http://localhost:5000/api/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{
+    "username": "usuario123",
+    "password": "senha123"
+  }'
+```
+
+---
+
+### 3. Perfil do Usuário
+**GET** `/api/auth/me`
+
+Retorna informações do usuário autenticado.
+
+**Headers:**
+```
+Authorization: Bearer <token>
+```
+
+**Resposta (200):**
+```json
+{
+  "usuario_id": 1,
+  "username": "usuario123",
+  "email": "usuario@example.com",
+  "ativo": true,
+  "admin": false,
+  "criado_em": "2025-12-01T14:00:00",
+  "ultimo_login": "2025-12-01T15:00:00"
+}
+```
+
+---
+
+### 4. Listar Usuários (Admin)
+**GET** `/api/auth/users`
+
+Lista todos os usuários cadastrados. **Apenas administradores**.
+
+**Headers:**
+```
+Authorization: Bearer <token>
+```
+
+**Resposta (200):**
+```json
+[
+  {
+    "usuario_id": 1,
+    "username": "admin",
+    "email": "admin@example.com",
+    "ativo": true,
+    "admin": true,
+    "criado_em": "2025-12-01T14:00:00",
+    "ultimo_login": "2025-12-01T15:00:00"
+  }
+]
+```
+
+**Erros:**
+- `401`: Token não fornecido ou inválido
+- `403`: Acesso negado (apenas administradores)
+
+---
+
 ## Endpoints REST
 
 ### 1. Health Check
@@ -25,6 +198,13 @@ Verifica se o servidor está ativo.
 **POST** `/api/produtos`
 
 Cadastra um novo produto para simulação.
+
+**🔒 Requer autenticação**
+
+**Headers:**
+```
+Authorization: Bearer <token>
+```
 
 **Body (JSON):**
 ```json
@@ -69,10 +249,18 @@ Cadastra um novo produto para simulação.
 - `409`: Já existe um produto com o mesmo nome ou tópico
 - `500`: Erro interno do servidor
 
-**Exemplo de sucesso:**
+**Exemplo de uso:**
 ```bash
+# Primeiro, faça login para obter o token
+TOKEN=$(curl -X POST http://localhost:5000/api/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"username": "usuario123", "password": "senha123"}' \
+  | jq -r '.access_token')
+
+# Depois, use o token para cadastrar produto
 curl -X POST http://localhost:5000/api/produtos \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
   -d '{
     "nome": "Leite",
     "pesoMinimo": 100,
@@ -136,6 +324,13 @@ Lista todos os produtos cadastrados.
 **DELETE** `/api/produtos/{produto_id}`
 
 Remove um produto cadastrado.
+
+**🔒 Requer autenticação**
+
+**Headers:**
+```
+Authorization: Bearer <token>
+```
 
 **Parâmetros:**
 - `produto_id` (int) - ID do produto
@@ -203,10 +398,12 @@ Simula a retirada manual de produtos (reduz o peso do estoque). **Centralizado n
 # Retirada com quantidade específica
 curl -X POST http://localhost:5000/api/produtos/1/retirada \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
   -d '{"quantidade": 50}'
 
 # Retirada com quantidade aleatória
-curl -X POST http://localhost:5000/api/produtos/1/retirada
+curl -X POST http://localhost:5000/api/produtos/1/retirada \
+  -H "Authorization: Bearer $TOKEN"
 ```
 
 ---
@@ -260,10 +457,12 @@ Simula a reposição manual de produtos (aumenta o peso do estoque). **Centraliz
 # Reposição com quantidade específica
 curl -X POST http://localhost:5000/api/produtos/1/reposicao \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
   -d '{"quantidade": 25}'
 
 # Reposição com quantidade aleatória
-curl -X POST http://localhost:5000/api/produtos/1/reposicao
+curl -X POST http://localhost:5000/api/produtos/1/reposicao \
+  -H "Authorization: Bearer $TOKEN"
 ```
 
 ---
@@ -274,13 +473,58 @@ curl -X POST http://localhost:5000/api/produtos/1/reposicao
 
 Conecte-se ao WebSocket em: `ws://localhost:5000`
 
+**🔐 Autenticação Obrigatória:** O WebSocket requer autenticação JWT obrigatória via token no evento de conexão. Conexões sem token válido serão rejeitadas.
+
+**Exemplo de conexão:**
+```javascript
+// 1. Primeiro, faça login para obter o token
+const response = await fetch('http://localhost:5000/api/auth/login', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({
+    username: 'usuario123',
+    password: 'senha123'
+  })
+});
+
+const { access_token } = await response.json();
+
+// 2. Conecte ao WebSocket com o token
+const socket = io('http://localhost:5000', {
+  auth: {
+    token: access_token
+  }
+});
+
+socket.on('connect', () => {
+  console.log('Conectado ao WebSocket');
+});
+
+socket.on('connect_error', (error) => {
+  console.error('Erro ao conectar:', error.message);
+  // Possíveis erros:
+  // - Token não fornecido
+  // - Token inválido ou expirado
+  // - Usuário não encontrado ou inativo
+});
+```
+
 ### Eventos
 
 #### 1. `connect` (Cliente → Servidor)
-Evento automático quando o cliente se conecta.
+Evento automático quando o cliente se conecta com sucesso (após autenticação válida).
+
+**Requisitos:**
+- Token JWT válido deve ser fornecido no objeto `auth` da conexão
+- O usuário associado ao token deve existir e estar ativo
 
 **Resposta do servidor:**
 O servidor envia automaticamente o evento `produtos_iniciais` com todos os produtos atuais.
+
+**Erros de conexão:**
+- Se o token não for fornecido, a conexão será rejeitada
+- Se o token for inválido ou expirado, a conexão será rejeitada
+- Se o usuário não existir ou estiver inativo, a conexão será rejeitada
 
 #### 2. `produtos_iniciais` (Servidor → Cliente)
 Enviado quando um cliente se conecta, contendo todos os produtos cadastrados com dados atuais.
