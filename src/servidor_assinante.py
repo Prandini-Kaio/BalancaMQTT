@@ -13,7 +13,7 @@ from flask_cors import CORS
 from flask_socketio import SocketIO, emit
 from flask_jwt_extended import (
     JWTManager, jwt_required, create_access_token,
-    get_jwt_identity, get_jwt
+    get_jwt_identity, get_jwt, decode_token
 )
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -72,6 +72,61 @@ class ServidorBackend:
         self.app.config['JWT_ACCESS_TOKEN_EXPIRES'] = JWT_ACCESS_TOKEN_EXPIRES
         self.jwt = JWTManager(self.app)
         
+        @self.jwt.token_in_blocklist_loader
+        def check_if_token_revoked(jwt_header, jwt_payload):
+            return False
+        
+        # Handlers de erro JWT para retornar mensagens claras
+        @self.jwt.expired_token_loader
+        def expired_token_callback(jwt_header, jwt_payload):
+            print(f"[JWT] ❌ Token expirado")
+            return jsonify({'erro': 'Token expirado. Faça login novamente.'}), 401
+        
+        @self.jwt.invalid_token_loader
+        def invalid_token_callback(error):
+            error_str = str(error)
+            print(f"[JWT] ❌ Token inválido: {error_str}")
+            
+            if 'Subject must be a string' in error_str:
+                try:
+                    from flask import request
+                    auth_header = request.headers.get('Authorization', '')
+                    if auth_header.startswith('Bearer '):
+                        token = auth_header.split(' ')[1]
+                        import jwt as pyjwt
+                        # Decodifica sem validação para pegar o sub
+                        decoded = pyjwt.decode(token, options={"verify_signature": False})
+                        if 'sub' in decoded:
+                            print(f"[JWT] ⚠️ Token antigo detectado com sub={decoded['sub']} (tipo: {type(decoded['sub']).__name__})")
+                            print(f"[JWT] 💡 Faça um novo login para obter um token atualizado")
+                except:
+                    pass
+            
+            # Retorna mensagem mais amigável para tokens antigos
+            if 'Subject must be a string' in error_str:
+                return jsonify({
+                    'erro': 'Token criado com versão antiga do sistema. Faça um novo login para obter um token atualizado.',
+                    'detalhes': 'Este token foi criado antes da atualização que exige que o subject seja uma string. Por favor, faça logout e login novamente.'
+                }), 401
+            
+            return jsonify({'erro': f'Token inválido. Verifique se o token está correto ou faça login novamente. Detalhes: {error_str}'}), 401
+        
+        @self.jwt.unauthorized_loader
+        def missing_token_callback(error):
+            print(f"[JWT] Token não fornecido: {str(error)}")
+            return jsonify({'erro': 'Token não fornecido. Inclua o header Authorization: Bearer <token>. Detalhes: ' + str(error)}), 401
+        
+        @self.jwt.needs_fresh_token_loader
+        def token_not_fresh_callback(jwt_header, jwt_payload):
+            print(f"[JWT] Token não está fresco")
+            return jsonify({'erro': 'Token não está fresco. Faça login novamente.'}), 401
+        
+        # Handler para erros de revogação (se implementado futuramente)
+        @self.jwt.revoked_token_loader
+        def revoked_token_callback(jwt_header, jwt_payload):
+            print(f"[JWT] Token revogado")
+            return jsonify({'erro': 'Token foi revogado. Faça login novamente.'}), 401
+        
         # Inicializa banco de dados (com retry para aguardar PostgreSQL estar pronto)
         try:
             init_db(self.app)
@@ -81,6 +136,40 @@ class ServidorBackend:
             print(f"[DB] ⚠️ O sistema continuará, mas algumas funcionalidades podem não funcionar até o banco estar disponível")
         
         CORS(self.app)
+        
+        # Middleware para normalizar tokens antigos (compatibilidade)
+        @self.app.before_request
+        def normalize_jwt_token():
+            """Normaliza tokens JWT antigos convertendo sub de int para string"""
+            from flask import request
+            auth_header = request.headers.get('Authorization', '')
+            if auth_header.startswith('Bearer '):
+                token = auth_header.split(' ')[1]
+                try:
+                    import jwt as pyjwt
+                    decoded = pyjwt.decode(token, options={"verify_signature": False})
+                    if 'sub' in decoded and not isinstance(decoded['sub'], str):
+                        pass
+                except:
+                    pass
+        
+        # Handler global para erros 422 (Unprocessable Entity)
+        @self.app.errorhandler(422)
+        def handle_unprocessable_entity(e):
+            """Handle 422 Unprocessable Entity errors"""
+            print(f"[ERRO] 422 Unprocessable Entity: {str(e)}")
+            # Tenta extraer informações do erro
+            if hasattr(e, 'data') and e.data:
+                return jsonify({
+                    'erro': 'Erro de validação',
+                    'detalhes': e.data.get('messages', {}),
+                    'mensagem': 'Verifique se todos os campos estão no formato correto e se o Content-Type é application/json'
+                }), 422
+            return jsonify({
+                'erro': 'Erro de validação (422)',
+                'mensagem': 'A requisição não pode ser processada. Verifique se: 1) O Content-Type é application/json, 2) O token JWT está no formato correto (Authorization: Bearer <token>), 3) Todos os campos obrigatórios foram fornecidos.'
+            }), 422
+        
         self.socketio = SocketIO(
             self.app, 
             cors_allowed_origins="*", 
@@ -589,7 +678,7 @@ class ServidorBackend:
                     
                     # Gera token JWT
                     access_token = create_access_token(
-                        identity=usuario.usuario_id,
+                        identity=str(usuario.usuario_id),
                         additional_claims={
                             'username': usuario.username,
                             'admin': usuario.admin
@@ -616,12 +705,15 @@ class ServidorBackend:
         def perfil_usuario():
             """Retorna informações do usuário autenticado"""
             try:
-                usuario_id = get_jwt_identity()
+                usuario_id_str = get_jwt_identity()
+                usuario_id = int(usuario_id_str) if isinstance(usuario_id_str, str) else usuario_id_str
                 with self.app.app_context():
                     usuario = User.query.get(usuario_id)
                     if not usuario:
                         return jsonify({'erro': 'Usuário não encontrado'}), 404
                     return jsonify(usuario.to_dict()), 200
+            except (ValueError, TypeError) as e:
+                return jsonify({'erro': f'ID de usuário inválido: {str(e)}'}), 400
             except Exception as e:
                 return jsonify({'erro': f'Erro ao buscar perfil: {str(e)}'}), 500
         
@@ -630,7 +722,8 @@ class ServidorBackend:
         def listar_usuarios():
             """Lista todos os usuários (apenas administradores)"""
             try:
-                usuario_id = get_jwt_identity()
+                usuario_id_str = get_jwt_identity()
+                usuario_id = int(usuario_id_str) if isinstance(usuario_id_str, str) else usuario_id_str
                 with self.app.app_context():
                     usuario = User.query.get(usuario_id)
                     if not usuario or not usuario.admin:
@@ -638,6 +731,8 @@ class ServidorBackend:
                     
                     usuarios = User.query.all()
                     return jsonify([u.to_dict() for u in usuarios]), 200
+            except (ValueError, TypeError) as e:
+                return jsonify({'erro': f'ID de usuário inválido: {str(e)}'}), 400
             except Exception as e:
                 return jsonify({'erro': f'Erro ao listar usuários: {str(e)}'}), 500
         
@@ -648,7 +743,14 @@ class ServidorBackend:
         def cadastrar_produto():
             """Cadastra um novo produto para simulação"""
             try:
+                # Verifica se há dados JSON na requisição
+                if not request.is_json:
+                    return jsonify({'erro': 'Content-Type deve ser application/json'}), 400
+                
                 data = request.get_json()
+                
+                if data is None:
+                    return jsonify({'erro': 'Body da requisição está vazio ou não é JSON válido'}), 400
                 
                 # Validação dos campos obrigatórios
                 if not data or 'nome' not in data:
@@ -740,7 +842,6 @@ class ServidorBackend:
                 return jsonify({'erro': f'Erro ao listar produtos: {str(e)}'}), 500
         
         @self.app.route('/api/produtos', methods=['GET'])
-        @jwt_required()
         def listar_produtos_cadastrados():
             """Lista todos os produtos cadastrados"""
             try:
@@ -917,49 +1018,30 @@ class ServidorBackend:
         
         @self.socketio.on('connect')
         def handle_connect(auth):
-            """Conecta cliente ao WebSocket (autenticação obrigatória)"""
-            print(f"[WEBSOCKET] Tentativa de conexão recebida")
-            
-            # Autenticação obrigatória via token no auth
-            if not auth or not isinstance(auth, dict) or 'token' not in auth:
-                print(f"[WEBSOCKET] ❌ Conexão rejeitada: Token não fornecido")
-                return False  # Rejeita a conexão
-            
+            """Conecta cliente ao WebSocket (público, sem autenticação)"""
             try:
-                from flask_jwt_extended import decode_token
-                decoded = decode_token(auth['token'])
-                usuario_id = decoded.get('sub')
+                print(f"[WEBSOCKET] ✅ Cliente conectado (público)")
                 
-                with self.app.app_context():
-                    usuario_autenticado = User.query.get(usuario_id)
-                    if not usuario_autenticado:
-                        print(f"[WEBSOCKET] ❌ Conexão rejeitada: Usuário não encontrado")
-                        return False
-                    
-                    if not usuario_autenticado.ativo:
-                        print(f"[WEBSOCKET] ❌ Conexão rejeitada: Usuário inativo")
-                        return False
-                    
-                    print(f"[WEBSOCKET] ✅ Cliente autenticado e conectado: {usuario_autenticado.username}")
-                    
-                    # Obtém lista de produtos
-                    with self.lock:
-                        produtos_list = list(self.produtos_dados.values())
-                        num_produtos = len(produtos_list)
+                # Obtém lista de produtos
+                with self.lock:
+                    produtos_list = list(self.produtos_dados.values())
+                    num_produtos = len(produtos_list)
 
-                    if num_produtos > 0:
-                        print(f"[WEBSOCKET] 📦 Enviando {num_produtos} produto(s) iniciais")
-                        emit('produtos_iniciais', produtos_list)
-                        print(f"[WEBSOCKET] ✅ Produtos iniciais enviados")
-                    else:
-                        print(f"[WEBSOCKET] ⚠️ Nenhum produto com dados ainda. Enviando lista vazia.")
-                        emit('produtos_iniciais', [])
-                    
-                    return True  # Aceita a conexão
+                if num_produtos > 0:
+                    print(f"[WEBSOCKET] 📦 Enviando {num_produtos} produto(s) iniciais")
+                    emit('produtos_iniciais', produtos_list)
+                    print(f"[WEBSOCKET] ✅ Produtos iniciais enviados")
+                else:
+                    print(f"[WEBSOCKET] ⚠️ Nenhum produto com dados ainda. Enviando lista vazia.")
+                    emit('produtos_iniciais', [])
+                
+                return True
                     
             except Exception as e:
-                print(f"[WEBSOCKET] ❌ Conexão rejeitada: Token inválido ou expirado - {e}")
-                return False  # Rejeita a conexão
+                print(f"[WEBSOCKET] Erro ao conectar: {type(e).__name__}: {e}")
+                import traceback
+                traceback.print_exc()
+                return False
         
         @self.socketio.on('disconnect')
         def handle_disconnect():
@@ -980,7 +1062,7 @@ class ServidorBackend:
         thread = Thread(target=run_api, daemon=True)
         thread.start()
         print(f"[API] Servidor iniciado em http://{self.api_host}:{self.api_port}")
-        print(f"[API] WebSocket disponível em ws://{self.api_host}:{self.api_port}")
+        print(f"[API] WebSocket disponível em ws://{self.api_host}:{self.api_port} (público)")
         print(f"[API] Endpoints disponíveis:")
         print(f"       GET  /api/ping - Status do servidor (público)")
         print(f"       POST /api/auth/register - Registrar usuário (público)")
@@ -989,7 +1071,7 @@ class ServidorBackend:
         print(f"       GET  /api/auth/users - Listar usuários (🔒 admin)")
         print(f"       GET  /api/produtos/public - Listar produtos (público, uso interno)")
         print(f"       POST /api/produtos - Cadastrar produto (🔒)")
-        print(f"       GET  /api/produtos - Listar produtos (🔒)")
+        print(f"       GET  /api/produtos - Listar produtos (público)")
         print(f"       DELETE /api/produtos/<id> - Remover produto (🔒)")
         print(f"       POST /api/produtos/<id>/retirada - Retirar peso (🔒)")
         print(f"       POST /api/produtos/<id>/reposicao - Repor peso (🔒)")
